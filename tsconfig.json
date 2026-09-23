@@ -1,0 +1,34 @@
+{
+  // Compiler settings. `npm run typecheck` checks types; `npm run build` emits JavaScript into dist/.
+  "compilerOptions": {
+    // Node 22+ supports modern JavaScript natively, so there's no need to downlevel.
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "types": ["node"],
+
+    // Native ES modules (import/export) resolved the way Node resolves them.
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+
+    // Lets us write `import ... from "./config.ts"` (the real file name).
+    // tsc rewrites it to "./config.js" in the build output.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    // Only allow TypeScript syntax that can simply be erased (no enums, etc.),
+    // so the same files also run with Node's built-in type stripping.
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+
+    // Strictness: catch mistakes at compile time rather than on a live payment.
+    "strict": true,
+    // arr[0] and obj[key] may be undefined; make us handle that explicitly.
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+
+    "outDir": "dist",
+    "rootDir": ".",
+    "sourceMap": true,
+    "skipLibCheck": true
+  },
+  "include": ["src", "scripts", "tests"]
+}

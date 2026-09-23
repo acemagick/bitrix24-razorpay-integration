@@ -1,0 +1,36 @@
+{
+  "name": "bitrix24-razorpay-integration",
+  "version": "1.0.0",
+  "description": "Creates Razorpay payment links for Bitrix24 deals and posts payment status back to the deal timeline.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc",
+    "start": "node dist/src/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "list-fields": "tsx scripts/listFields.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/acemagick/bitrix24-razorpay-integration.git"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "big.js": "^7.0.1",
+    "express": "^5.2.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/big.js": "^7.0.0",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  }
+}

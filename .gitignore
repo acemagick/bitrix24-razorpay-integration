@@ -1,10 +1,14 @@
-# Python-generated files
+# Dependencies and build output
+node_modules/
+dist/
+
+# Secrets - never commit real keys
+.env
+
+# Runtime data (processed webhook event ids)
+data/
+
+# Python reference copy (python-reference/)
+.venv/
 __pycache__/
 *.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
