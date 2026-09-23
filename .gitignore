@@ -8,7 +8,5 @@ dist/
 # Runtime data (processed webhook event ids)
 data/
 
-# Python reference copy (python-reference/)
-.venv/
-__pycache__/
-*.py[oc]
+# Old Python version, kept locally for reference only
+python-reference/
