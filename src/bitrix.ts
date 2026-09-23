@@ -171,7 +171,7 @@ export class BitrixClient {
       } catch {
         // Not JSON at all: usually a proxy/maintenance HTML page or a 502/503.
         throw new BitrixUnavailableError(
-          `${method}: Bitrix24 returned HTTP ${response.status} with a non-JSON body: ${JSON.stringify(text.slice(0, 200))}`,
+          `${method}: Bitrix24 returned HTTP ${response.status} with a non-JSON body: ${JSON.stringify(text.replace(/\s+/g, " ").slice(0, 200))}`,
         );
       }
 

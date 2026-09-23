@@ -13,7 +13,8 @@
     "start": "node dist/src/main.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "list-fields": "tsx scripts/listFields.ts"
+    "list-fields": "tsx scripts/listFields.ts",
+    "check-setup": "tsx scripts/checkSetup.ts"
   },
   "repository": {
     "type": "git",

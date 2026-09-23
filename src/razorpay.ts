@@ -161,7 +161,7 @@ export class RazorpayClient {
       parsed = JSON.parse(text);
     } catch {
       throw new RazorpayUnavailableError(
-        `${method} ${path}: Razorpay returned HTTP ${response.status} with a non-JSON body: ${JSON.stringify(text.slice(0, 200))}`,
+        `${method} ${path}: Razorpay returned HTTP ${response.status} with a non-JSON body: ${JSON.stringify(text.replace(/\s+/g, " ").slice(0, 200))}`,
       );
     }
 
@@ -180,33 +180,7 @@ export class RazorpayClient {
    * had a link" by picking the next free reference_id.
    */
   async createPaymentLink(input: CreatePaymentLinkInput, referenceId: string): Promise<PaymentLink> {
-    const payload: Record<string, unknown> = {
-      amount: toPaise(input.amount), // Razorpay wants the smallest unit: 1499.99 INR -> 149999 paise
-      currency: input.currency,
-      description: input.description.slice(0, 2048), // Razorpay's max length
-      // reference_id is how a payment gets matched back to the deal. Razorpay
-      // enforces uniqueness, which also stops us from creating two links in a race.
-      reference_id: referenceId,
-      // We send the link to the customer ourselves (e.g. from Bitrix), so stop
-      // Razorpay from also sending its own SMS/email.
-      notify: { sms: false, email: false },
-      reminder_enable: false,
-      // notes are free-form key/value pairs that Razorpay echoes back in every
-      // webhook for this link. The deal ID here is our primary way to find the
-      // deal again, even after the reference_id gets a "-2" suffix.
-      notes: { bitrix_deal_id: input.dealId },
-      accept_partial: input.acceptPartial ?? false,
-    };
-
-    const customer = buildCustomer(input.customer);
-    if (customer) payload.customer = customer;
-
-    if (input.expireInDays) {
-      // expire_by is a Unix timestamp in seconds (not milliseconds).
-      payload.expire_by = Math.floor(Date.now() / 1000) + input.expireInDays * 24 * 60 * 60;
-    }
-
-    return this.request<PaymentLink>("POST", "/payment_links", payload);
+    return this.request<PaymentLink>("POST", "/payment_links", buildPaymentLinkPayload(input, referenceId));
   }
 
   /**
@@ -248,6 +222,49 @@ export class RazorpayClient {
   async fetchOrder(orderId: string): Promise<RazorpayOrder> {
     return this.request<RazorpayOrder>("GET", `/orders/${encodeURIComponent(orderId)}`);
   }
+
+  /**
+   * Check that the API keys work by making a harmless read-only request (list
+   * one order). Throws RazorpayApiError with isAuthError=true if the keys are wrong.
+   */
+  async verifyCredentials(): Promise<void> {
+    await this.request("GET", "/orders?count=1");
+  }
+}
+
+/**
+ * Build the JSON body for POST /payment_links.
+ *
+ * A separate function (not buried inside createPaymentLink) so it can be tested,
+ * and previewed by `npm run check-setup` without creating anything.
+ */
+export function buildPaymentLinkPayload(input: CreatePaymentLinkInput, referenceId: string): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    amount: toPaise(input.amount), // Razorpay wants the smallest unit: 1499.99 INR -> 149999 paise
+    currency: input.currency,
+    description: input.description.slice(0, 2048), // Razorpay's max length
+    // reference_id is how a payment gets matched back to the deal. Razorpay
+    // enforces uniqueness, which also stops us from creating two links in a race.
+    reference_id: referenceId,
+    // We send the link to the customer ourselves (e.g. from Bitrix), so stop
+    // Razorpay from also sending its own SMS/email.
+    notify: { sms: false, email: false },
+    reminder_enable: false,
+    // notes are free-form key/value pairs that Razorpay echoes back in every
+    // webhook for this link. The deal ID here is our primary way to find the
+    // deal again, even after the reference_id gets a "-2" suffix.
+    notes: { bitrix_deal_id: input.dealId },
+    accept_partial: input.acceptPartial ?? false,
+  };
+
+  const customer = buildCustomer(input.customer);
+  if (customer) payload.customer = customer;
+
+  if (input.expireInDays) {
+    // expire_by is a Unix timestamp in seconds (not milliseconds).
+    payload.expire_by = Math.floor(Date.now() / 1000) + input.expireInDays * 24 * 60 * 60;
+  }
+  return payload;
 }
 
 // --------------------------------------------------------------------------- money helpers
