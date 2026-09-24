@@ -111,52 +111,97 @@ describe("ProcessedEventStore", () => {
 
 // --------------------------------------------------------------------------- which deal?
 
+/**
+ * Fakes where deal 42 has plink_ABC (the link linkEntity() describes, with
+ * order_123 like paymentEntity()) saved in its Link ID field, as this service
+ * does when it creates a link.
+ */
+function webhookSetup() {
+  const bitrix = createFakeBitrix();
+  bitrix.deals.set("42", deal({ ID: "42", UF_CRM_LINK_ID: "plink_ABC" }));
+  const rzp = createFakeRazorpay();
+  rzp.addLink({ id: "plink_ABC", reference_id: "42", notes: { bitrix_deal_id: "42" }, order_id: "order_123" });
+  const unresolvedLinks = new Map<string, string>();
+  const deps = { bitrix: bitrix.client, razorpay: rzp.client, linkIdField: "UF_CRM_LINK_ID", unresolvedLinks, moveDealToWon: false };
+  return { bitrix, rzp, unresolvedLinks, deps };
+}
+
 describe("resolveDealId", () => {
-  const noOrders = createFakeRazorpay().client;
+  const failedWith = (fields: Record<string, unknown>) => parse(webhookBody("payment.failed", { payment: paymentEntity(fields) }));
 
-  it("prefers notes.bitrix_deal_id on the payment link", async () => {
+  it("prefers notes.bitrix_deal_id on the payment link, once the link checks out", async () => {
+    const { deps } = webhookSetup();
     const webhook = parse(webhookBody("payment_link.paid", { payment_link: linkEntity({ reference_id: "99" }) }));
-    expect(await resolveDealId(webhook, noOrders)).toEqual({ dealId: "42", source: "payment_link.notes" });
+    expect(await resolveDealId(webhook, deps)).toEqual({ dealId: "42", source: "payment_link.notes" });
   });
 
-  it('falls back to the reference_id, stripping a "-3" suffix', async () => {
-    const webhook = parse(
-      webhookBody("payment_link.paid", { payment_link: linkEntity({ notes: [], reference_id: "77-3" }) }),
-    );
-    expect(await resolveDealId(webhook, noOrders)).toEqual({ dealId: "77", source: "payment_link.reference_id" });
+  it.each([["54"], ["77-3"], ["INV-001"]])(
+    "never matches by reference_id alone (a hand-made link with reference %s)",
+    async (referenceId) => {
+      // No bitrix_deal_id note means this link wasn't created by this service,
+      // even if its reference happens to look like one of our deal IDs.
+      const { deps } = webhookSetup();
+      const webhook = parse(
+        webhookBody("payment_link.paid", { payment_link: linkEntity({ notes: [], reference_id: referenceId }) }),
+      );
+      expect(await resolveDealId(webhook, deps)).toBeUndefined();
+    },
+  );
+
+  it("ignores deal 42's note copied onto another link", async () => {
+    // Razorpay signs the webhook, but anyone can write (or copy) notes.
+    const { deps, bitrix } = webhookSetup();
+    const webhook = parse(webhookBody("payment_link.paid", { payment_link: linkEntity({ id: "plink_Copy" }) }));
+    expect(await resolveDealId(webhook, deps)).toBeUndefined();
+    expect(bitrix.comments("42")).toEqual([]);
   });
 
-  it("ignores a hand-made reference like INV-001", async () => {
-    const webhook = parse(
-      webhookBody("payment_link.paid", { payment_link: linkEntity({ notes: [], reference_id: "INV-001" }) }),
-    );
-    expect(await resolveDealId(webhook, noOrders)).toBeUndefined();
+  it("ignores deal 42's note copied onto an unrelated payment (e.g. a website's Checkout)", async () => {
+    const { deps } = webhookSetup();
+    expect(await resolveDealId(failedWith({ notes: { bitrix_deal_id: "42" }, order_id: "order_Web" }), deps)).toBeUndefined();
+    expect(await resolveDealId(failedWith({ notes: { bitrix_deal_id: "42" }, order_id: null }), deps)).toBeUndefined();
   });
 
-  it("uses the payment's notes for payment.failed", async () => {
-    const webhook = parse(webhookBody("payment.failed", { payment: paymentEntity({ notes: { bitrix_deal_id: "42" } }) }));
-    expect(await resolveDealId(webhook, noOrders)).toEqual({ dealId: "42", source: "payment.notes" });
+  it("accepts a link this service created but couldn't save to the deal", async () => {
+    const { deps, bitrix, unresolvedLinks } = webhookSetup();
+    bitrix.deals.set("42", deal({ ID: "42", UF_CRM_LINK_ID: "plink_Older" }));
+    unresolvedLinks.set("42", "plink_ABC");
+    const webhook = parse(webhookBody("payment_link.paid", { payment_link: linkEntity() }));
+    expect(await resolveDealId(webhook, deps)).toEqual({ dealId: "42", source: "payment_link.notes" });
+  });
+
+  it("returns undefined when the deal can't be loaded to check the link", async () => {
+    const { deps, bitrix } = webhookSetup();
+    bitrix.deals.delete("42");
+    const webhook = parse(webhookBody("payment_link.paid", { payment_link: linkEntity() }));
+    expect(await resolveDealId(webhook, deps)).toBeUndefined();
+  });
+
+  it("uses the payment's notes for payment.failed, if its order is the deal link's order", async () => {
+    const { deps } = webhookSetup();
+    expect(await resolveDealId(failedWith({ notes: { bitrix_deal_id: "42" } }), deps)).toEqual({
+      dealId: "42",
+      source: "payment.notes",
+    });
   });
 
   it("as a last resort, asks Razorpay for the order", async () => {
-    const rzp = createFakeRazorpay();
+    const { deps, rzp } = webhookSetup();
     rzp.orders.set("order_123", { id: "order_123", receipt: null, notes: { bitrix_deal_id: "42" } });
-    const webhook = parse(webhookBody("payment.failed", { payment: paymentEntity() }));
-    expect(await resolveDealId(webhook, rzp.client)).toEqual({ dealId: "42", source: "fetched order.notes" });
+    expect(await resolveDealId(failedWith({}), deps)).toEqual({ dealId: "42", source: "fetched order.notes" });
   });
 
   it("returns undefined for payments unrelated to our links (e.g. website checkout)", async () => {
-    const rzp = createFakeRazorpay();
+    const { deps, rzp, bitrix } = webhookSetup();
     rzp.orders.set("order_123", { id: "order_123", receipt: "web-1", notes: [] });
-    const webhook = parse(webhookBody("payment.failed", { payment: paymentEntity() }));
-    expect(await resolveDealId(webhook, rzp.client)).toBeUndefined();
+    expect(await resolveDealId(failedWith({}), deps)).toBeUndefined();
+    expect(bitrix.calls).toEqual([]); // no claim, so nothing to check
   });
 
   it("returns undefined (not an error) when the order lookup fails", async () => {
-    const rzp = createFakeRazorpay();
+    const { deps, rzp } = webhookSetup();
     rzp.failOn("GET /orders/:id", () => json(401, { error: { code: "BAD_REQUEST_ERROR", description: "Authentication failed" } }));
-    const webhook = parse(webhookBody("payment.failed", { payment: paymentEntity() }));
-    expect(await resolveDealId(webhook, rzp.client)).toBeUndefined();
+    expect(await resolveDealId(failedWith({}), deps)).toBeUndefined();
   });
 });
 
@@ -250,62 +295,62 @@ describe("processWebhook", () => {
     parse(webhookBody("payment_link.paid", { payment_link: linkEntity({ amount_paid: 149_999 }), payment: paymentEntity() }));
 
   it("posts the comment on the right deal", async () => {
-    const bitrix = createFakeBitrix();
-    const outcome = await processWebhook(paid(), { bitrix: bitrix.client, razorpay: createFakeRazorpay().client, moveDealToWon: false });
+    const { bitrix, deps } = webhookSetup();
+    const outcome = await processWebhook(paid(), deps);
     expect(outcome).toEqual({ status: "done", dealId: "42", commented: true });
     expect(bitrix.comments("42")).toHaveLength(1);
     expect(bitrix.callsTo("crm.deal.update")).toHaveLength(0);
   });
 
+  it("does nothing to the deal when the link isn't the deal's own", async () => {
+    const { bitrix, deps } = webhookSetup();
+    const copied = parse(
+      webhookBody("payment_link.paid", { payment_link: linkEntity({ id: "plink_Copy", amount_paid: 149_999 }), payment: paymentEntity() }),
+    );
+    expect(await processWebhook(copied, { ...deps, moveDealToWon: true })).toEqual({ status: "no_deal" });
+    expect(bitrix.comments("42")).toEqual([]);
+    expect(bitrix.callsTo("crm.deal.update")).toHaveLength(0);
+  });
+
   it("moves the deal to its pipeline's Won stage when enabled", async () => {
-    const bitrix = createFakeBitrix();
-    bitrix.deals.set("42", deal({ ID: "42", CATEGORY_ID: "3" }));
-    const outcome = await processWebhook(paid(), { bitrix: bitrix.client, razorpay: createFakeRazorpay().client, moveDealToWon: true });
+    const { bitrix, deps } = webhookSetup();
+    bitrix.deals.set("42", deal({ ID: "42", CATEGORY_ID: "3", UF_CRM_LINK_ID: "plink_ABC" }));
+    const outcome = await processWebhook(paid(), { ...deps, moveDealToWon: true });
     expect(outcome).toMatchObject({ status: "done", movedToWon: true });
     expect(bitrix.deals.get("42")?.STAGE_ID).toBe("C3:WON");
   });
 
   it("comments (instead of failing) when the move to Won is refused", async () => {
-    const bitrix = createFakeBitrix();
-    bitrix.deals.set("42", deal({ ID: "42" }));
+    const { bitrix, deps } = webhookSetup();
     bitrix.failOn("crm.deal.update", () => json(200, { error: "ACCESS_DENIED", error_description: "Access denied" }));
-    const outcome = await processWebhook(paid(), { bitrix: bitrix.client, razorpay: createFakeRazorpay().client, moveDealToWon: true });
+    const outcome = await processWebhook(paid(), { ...deps, moveDealToWon: true });
     expect(outcome).toMatchObject({ status: "done", commented: true, movedToWon: false });
     expect(bitrix.comments("42")[1]).toMatch(/could not be moved to Won automatically: .*ACCESS_DENIED/);
   });
 
   it("only moves to Won on payment_link.paid", async () => {
-    const bitrix = createFakeBitrix();
+    const { bitrix, deps } = webhookSetup();
     const failed = parse(webhookBody("payment.failed", { payment: paymentEntity({ notes: { bitrix_deal_id: "42" } }) }));
-    await processWebhook(failed, { bitrix: bitrix.client, razorpay: createFakeRazorpay().client, moveDealToWon: true });
+    expect(await processWebhook(failed, { ...deps, moveDealToWon: true })).toMatchObject({ status: "done", dealId: "42" });
     expect(bitrix.callsTo("crm.deal.update")).toHaveLength(0);
   });
 
   it("ignores events it doesn't handle", async () => {
-    const bitrix = createFakeBitrix();
-    const outcome = await processWebhook(parse(webhookBody("refund.created")), {
-      bitrix: bitrix.client,
-      razorpay: createFakeRazorpay().client,
-      moveDealToWon: false,
-    });
+    const { bitrix, deps } = webhookSetup();
+    const outcome = await processWebhook(parse(webhookBody("refund.created")), deps);
     expect(outcome.status).toBe("ignored");
     expect(bitrix.calls).toHaveLength(0);
   });
 
   it("skips payments that don't belong to any deal", async () => {
-    const outcome = await processWebhook(parse(webhookBody("payment.failed", { payment: paymentEntity({ order_id: null }) })), {
-      bitrix: createFakeBitrix().client,
-      razorpay: createFakeRazorpay().client,
-      moveDealToWon: false,
-    });
+    const { deps } = webhookSetup();
+    const outcome = await processWebhook(parse(webhookBody("payment.failed", { payment: paymentEntity({ order_id: null }) })), deps);
     expect(outcome).toEqual({ status: "no_deal" });
   });
 
   it("never throws, even when Bitrix is completely down", async () => {
-    const bitrix = createFakeBitrix();
+    const { bitrix, deps } = webhookSetup();
     bitrix.failOn("crm.timeline.comment.add", () => new Response("<html>down</html>", { status: 503 }));
-    await expect(
-      processWebhook(paid(), { bitrix: bitrix.client, razorpay: createFakeRazorpay().client, moveDealToWon: false }),
-    ).resolves.toEqual({ status: "done", dealId: "42", commented: false });
+    await expect(processWebhook(paid(), deps)).resolves.toEqual({ status: "done", dealId: "42", commented: false });
   });
 });

@@ -19,6 +19,8 @@ async function startApp(env: Record<string, string> = {}) {
   const bitrix = createFakeBitrix();
   const rzp = createFakeRazorpay();
   bitrix.deals.set("54", deal());
+  // The webhook fixtures are for deal 42's saved link, plink_ABC.
+  bitrix.deals.set("42", deal({ ID: "42", UF_CRM_LINK_ID: "plink_ABC" }));
 
   const dir = await mkdtemp(join(tmpdir(), "b24rzp-app-"));
   const eventStore = new ProcessedEventStore(join(dir, "events.json"));

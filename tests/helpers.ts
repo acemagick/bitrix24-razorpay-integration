@@ -167,6 +167,7 @@ export interface FakeLink {
   currency: string;
   status: string;
   reference_id: string;
+  order_id?: string;
   notes: Record<string, string>;
   /** The request body that created this link (only for links created through the API). */
   request?: Record<string, any>;

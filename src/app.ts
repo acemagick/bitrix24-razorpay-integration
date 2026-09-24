@@ -156,7 +156,13 @@ export function createApp(deps: AppDeps): CreatedApp {
     // processWebhook never throws; the .catch is a belt-and-braces guard,
     // because an unhandled rejection would crash the process.
     // The promise is remembered until it settles, so shutdown can wait for it.
-    const work = processWebhook(webhook, { bitrix, razorpay, moveDealToWon: config.moveDealToWon }).then(
+    const work = processWebhook(webhook, {
+      bitrix,
+      razorpay,
+      linkIdField: config.bitrixPaymentIdField,
+      unresolvedLinks,
+      moveDealToWon: config.moveDealToWon,
+    }).then(
       () => undefined,
       (err) => console.error("[webhook] processWebhook threw unexpectedly", err),
     );

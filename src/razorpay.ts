@@ -96,6 +96,8 @@ export interface PaymentLink {
   currency: string;
   status: string; // created | partially_paid | paid | expired | cancelled
   reference_id: string;
+  /** The order behind the link; payments on the link belong to it. */
+  order_id?: string | null;
   notes: Record<string, string> | [] | null;
 }
 
@@ -188,12 +190,13 @@ export class RazorpayClient {
    *
    * WHY the retry loop: Razorpay refuses a reference_id that another link is
    * still using. The first link for deal 123 gets "123"; if that's taken we try
-   * "123-2", "123-3"... The webhook handler strips the suffix (and prefers
-   * notes.bitrix_deal_id anyway).
+   * "123-2", "123-3"... The reference is only a label the customer sees as
+   * "RECEIPT"; payments are matched to deals by notes.bitrix_deal_id (checked
+   * against the deal's saved Link ID), never by reference.
    *
    * Seen in test mode: a CANCELLED link frees its reference_id, so it can be
    * reused. Two links can therefore share "123-2", but only one of them can
-   * still be paid. That's harmless: payments are matched by notes.bitrix_deal_id.
+   * still be paid. That's harmless: payments aren't matched by reference.
    *
    * Only DuplicateReferenceError triggers a retry. Any other error (bad amount,
    * auth failure, network) is thrown straight away.
@@ -261,16 +264,18 @@ export function buildPaymentLinkPayload(input: CreatePaymentLinkInput, reference
     amount: toPaise(input.amount), // Razorpay wants the smallest unit: 1499.99 INR -> 149999 paise
     currency: input.currency,
     description: input.description.slice(0, 2048), // Razorpay's max length
-    // reference_id is how a payment gets matched back to the deal. Razorpay
-    // enforces uniqueness, which also stops us from creating two links in a race.
+    // reference_id: shown to the customer as "RECEIPT" and searchable in the
+    // dashboard. Razorpay refuses one that an active link already uses, which
+    // also stops two links being created in a race.
     reference_id: referenceId,
     // We send the link to the customer ourselves (e.g. from Bitrix), so stop
     // Razorpay from also sending its own SMS/email.
     notify: { sms: false, email: false },
     reminder_enable: false,
     // notes are free-form key/value pairs that Razorpay echoes back in every
-    // webhook for this link. The deal ID here is our primary way to find the
-    // deal again, even after the reference_id gets a "-2" suffix.
+    // webhook for this link. The webhook handler uses the deal ID here to find
+    // the deal, then checks the deal's saved Link ID really is this link before
+    // acting, so notes copied onto another link or payment don't count.
     notes: { bitrix_deal_id: input.dealId },
     accept_partial: input.acceptPartial ?? false,
   };

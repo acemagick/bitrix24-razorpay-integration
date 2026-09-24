@@ -13,7 +13,9 @@
  *
  *   e.g.  npm run send-webhook -- paid 54 --amount 11.80
  *
- * The server must be running (npm run dev) with the same RAZORPAY_WEBHOOK_SECRET.
+ * The server must be running (npm run dev) with the same .env. The deal must
+ * already have a payment link created by the service: the server only acts on
+ * a deal's own saved link, so the fake event uses that link's ID.
  * The payloads copy the structure of real Razorpay webhooks, but the IDs are fake.
  * The server will post real comments on the Bitrix deal you name.
  */
@@ -22,7 +24,9 @@ import { createHmac, randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
 import Big from "big.js";
 
-import { loadDotEnv } from "../src/config.ts";
+import { BitrixClient } from "../src/bitrix.ts";
+import { getConfig, loadDotEnv } from "../src/config.ts";
+import { RazorpayClient } from "../src/razorpay.ts";
 
 loadDotEnv();
 
@@ -69,9 +73,28 @@ const amount = new Big(values.amount).times(100).round(0, Big.roundHalfUp).toNum
 const now = Math.floor(Date.now() / 1000);
 const notes = { bitrix_deal_id: dealId };
 
+// The server only acts on a deal's own link (the one saved in its Link ID
+// field), so the fake payload uses that link's real ID, and for payment.failed
+// its real order. Not needed for events that never reach that check.
+let linkId = id("plink");
+let orderId = id("order");
+if (event !== eventNames.other && !values["bad-signature"]) {
+  const config = getConfig();
+  const deal = await new BitrixClient(config.bitrixWebhookUrl).getDeal(dealId);
+  const saved = String(deal[config.bitrixPaymentIdField] ?? "").trim();
+  if (!saved) {
+    console.error(`Deal ${dealId} has no saved payment link. Create one first (POST /payment-links?deal_id=${dealId}).`);
+    process.exit(1);
+  }
+  linkId = saved;
+  if (event === "payment.failed") {
+    const link = await new RazorpayClient(config.razorpayKeyId, config.razorpayKeySecret.reveal()).fetchPaymentLink(saved);
+    if (link.order_id) orderId = link.order_id;
+    else console.warn(`Link ${saved} has no order yet, so the server will ignore this payment.failed.`);
+  }
+}
+
 // ---- build the payload, shaped like Razorpay's real webhooks
-const linkId = id("plink");
-const orderId = id("order");
 const paymentLink = (status: string, amountPaid: number) => ({
   entity: {
     id: linkId,

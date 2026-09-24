@@ -17,6 +17,7 @@ import { dirname } from "node:path";
 
 import type { BitrixClient } from "./bitrix.ts";
 import { isHandledEvent, type RazorpayWebhook } from "./models.ts";
+import type { UnresolvedLinkStore } from "./paymentLinks.ts";
 import { formatMoney, type RazorpayClient } from "./razorpay.ts";
 
 // =========================================================================== 1. signature
@@ -175,22 +176,61 @@ export interface ResolvedDeal {
   source: string;
 }
 
+/** What resolveDealId needs to check a webhook against this service's own records. */
+export interface DealLookupDeps {
+  bitrix: Pick<BitrixClient, "getDeal">;
+  razorpay: Pick<RazorpayClient, "fetchOrder" | "fetchPaymentLink">;
+  /** The deal field where this service saves each deal's current link ID (BITRIX_PAYMENT_ID_FIELD). */
+  linkIdField: string;
+  /** Links this service created but couldn't save to their deal. */
+  unresolvedLinks: Pick<UnresolvedLinkStore, "get">;
+}
+
 /**
- * Work out which Bitrix deal a webhook belongs to, trying the most reliable
- * place first:
+ * Work out which Bitrix deal a webhook belongs to.
+ *
+ * STEP 1, the claim: which deal do the notes name? Most reliable place first:
  *
  *   1. payment_link.notes.bitrix_deal_id  we put it there when creating the link
- *   2. payment_link.reference_id          "42" or "42-2": take the part before "-"
- *   3. payment.notes.bitrix_deal_id       for payment.failed, which has no payment_link
- *   4. order.notes.bitrix_deal_id         if the order came with the payload
- *   5. GET /orders/{order_id}             last resort for payment.failed: ask Razorpay
+ *   2. payment.notes.bitrix_deal_id       for payment.failed, which has no payment_link
+ *   3. order.notes.bitrix_deal_id         if the order came with the payload
+ *   4. GET /orders/{order_id}             last resort for payment.failed: ask Razorpay
  *
- * Returns undefined if none of them work. That's normal for payment.failed
- * events from payments that have nothing to do with our links (e.g. your
- * website's checkout), because Razorpay sends payment.failed for every payment
- * on the account.
+ * The reference_id ("42", "42-2") is deliberately NOT used: a link without our
+ * note was made some other way (e.g. by hand in the dashboard), and its
+ * reference could point at an unrelated deal that happens to have that number.
+ *
+ * STEP 2, the check: notes alone prove nothing. The webhook signature only
+ * proves Razorpay sent the event; anyone who can set notes (a website's
+ * Checkout, a dashboard user) can write bitrix_deal_id, or copy it from one of
+ * our links. So the event's link must be one this service recorded for that
+ * deal: the link ID saved on the deal, or one in the unresolved-link store.
+ * This also covers links created before any of this existed, since they were
+ * saved to their deal the same way.
+ *
+ * Returns undefined if there's no claim or the check fails. That's normal for
+ * payment.failed events from payments that have nothing to do with our links
+ * (e.g. your website's checkout), because Razorpay sends payment.failed for
+ * every payment on the account.
  */
-export async function resolveDealId(
+export async function resolveDealId(webhook: RazorpayWebhook, deps: DealLookupDeps): Promise<ResolvedDeal | undefined> {
+  const link = webhook.payload.payment_link?.entity;
+  const payment = webhook.payload.payment?.entity;
+  const claim = await claimedDeal(webhook, deps.razorpay);
+  if (!claim) return undefined;
+
+  if (!(await isRecordedLink(claim.dealId, link?.id, payment?.order_id, deps))) {
+    const what = link ? `link ${link.id}` : `the link behind order ${payment?.order_id ?? "(none)"}`;
+    console.warn(
+      `[webhook] Ignoring ${webhook.event}: notes name deal ${claim.dealId}, but ${what} is not one this service recorded for it`,
+    );
+    return undefined;
+  }
+  return claim;
+}
+
+/** Step 1: the deal ID the notes claim, unverified. */
+async function claimedDeal(
   webhook: RazorpayWebhook,
   razorpay: Pick<RazorpayClient, "fetchOrder">,
 ): Promise<ResolvedDeal | undefined> {
@@ -202,9 +242,6 @@ export async function resolveDealId(
 
   const candidates: [string, string | undefined][] = [
     ["payment_link.notes", fromNotes(link?.notes)],
-    // Only a reference like "42" or "42-3" counts. A link someone created by
-    // hand in the dashboard with reference "INV-001" must not map to a deal.
-    ["payment_link.reference_id", /^\d+(-\d+)?$/.test(link?.reference_id ?? "") ? link?.reference_id?.split("-")[0] : undefined],
     ["payment.notes", fromNotes(payment?.notes)],
     ["order.notes", fromNotes(order?.notes)],
   ];
@@ -224,6 +261,43 @@ export async function resolveDealId(
     }
   }
   return undefined;
+}
+
+/**
+ * Step 2: is the event's link one this service recorded for `dealId`?
+ *
+ * payment_link.* events name their link. payment.failed doesn't, only its
+ * order, so we fetch the deal's recorded links from Razorpay and compare orders.
+ * Any lookup failure counts as "no": better a missing comment than one on the
+ * wrong deal.
+ */
+async function isRecordedLink(
+  dealId: string,
+  linkId: string | undefined,
+  orderId: string | null | undefined,
+  deps: DealLookupDeps,
+): Promise<boolean> {
+  let deal;
+  try {
+    deal = await deps.bitrix.getDeal(dealId);
+  } catch (err) {
+    console.warn(`[webhook] Could not load deal ${dealId} to check its payment link: ${(err as Error).message}`);
+    return false;
+  }
+  const recorded = [String(deal[deps.linkIdField] ?? "").trim(), deps.unresolvedLinks.get(dealId)].filter(
+    (id): id is string => !!id,
+  );
+
+  if (linkId) return recorded.includes(linkId);
+  if (!orderId) return false;
+  for (const id of recorded) {
+    try {
+      if ((await deps.razorpay.fetchPaymentLink(id)).order_id === orderId) return true;
+    } catch (err) {
+      console.warn(`[webhook] Could not fetch link ${id} of deal ${dealId}: ${(err as Error).message}`);
+    }
+  }
+  return false;
 }
 
 function validDealId(value: string | undefined): string | undefined {
@@ -327,11 +401,10 @@ export function buildComment(webhook: RazorpayWebhook): string | undefined {
 
 // =========================================================================== 5. process
 
-export interface WebhookDeps {
+export interface WebhookDeps extends DealLookupDeps {
   // Pick<> lists exactly the methods we use, so tests can pass a small fake
   // object instead of a real client.
   bitrix: Pick<BitrixClient, "safeComment" | "getDeal" | "moveDealToWon">;
-  razorpay: Pick<RazorpayClient, "fetchOrder">;
   moveDealToWon: boolean;
 }
 
@@ -355,7 +428,7 @@ export async function processWebhook(webhook: RazorpayWebhook, deps: WebhookDeps
       return { status: "ignored", reason: `unhandled event ${webhook.event}` };
     }
 
-    const resolved = await resolveDealId(webhook, deps.razorpay);
+    const resolved = await resolveDealId(webhook, deps);
     if (!resolved) {
       console.info(`[webhook] ${webhook.event}: no Bitrix deal linked to this payment, skipping`);
       return { status: "no_deal" };
