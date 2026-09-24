@@ -8,6 +8,7 @@
 import { createApp } from "./app.ts";
 import { BitrixClient } from "./bitrix.ts";
 import { getConfig } from "./config.ts";
+import { UnresolvedLinkStore } from "./paymentLinks.ts";
 import { RazorpayClient } from "./razorpay.ts";
 import { ProcessedEventStore } from "./webhookHandler.ts";
 
@@ -24,8 +25,15 @@ const bitrix = new BitrixClient(config.bitrixWebhookUrl);
 const razorpay = new RazorpayClient(config.razorpayKeyId, config.razorpayKeySecret.reveal());
 const eventStore = new ProcessedEventStore(config.processedEventsPath);
 await eventStore.load(); // before accepting webhooks, so restarts remember past events
+const unresolvedLinks = new UnresolvedLinkStore(config.unresolvedLinksPath);
+try {
+  await unresolvedLinks.load(); // before accepting requests, so restarts remember possibly payable links
+} catch (err) {
+  console.error(`[server] Could not read ${config.unresolvedLinksPath}. Fix or remove it before starting.`, err);
+  process.exit(1);
+}
 
-const { app, drain } = createApp({ config, bitrix, razorpay, eventStore });
+const { app, drain } = createApp({ config, bitrix, razorpay, eventStore, unresolvedLinks });
 
 const server = app.listen(config.port, () => {
   const mode = config.razorpayKeyId.startsWith("rzp_test_") ? "TEST" : "LIVE";
@@ -60,6 +68,12 @@ async function shutdown(signal: string) {
     // (their 200 was sent, but their Bitrix comment may still be in progress).
     await drain();
     await eventStore.flush();
+    try {
+      await unresolvedLinks.flush();
+    } catch (err) {
+      console.error("[server] Could not save unresolved payment links", err);
+      process.exit(1);
+    }
     console.info("[server] Stopped");
     process.exit(0);
   });

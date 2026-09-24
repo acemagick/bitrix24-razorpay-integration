@@ -85,6 +85,8 @@ export interface CreateLinkResponse {
    * failed. The link still works; the timeline comment includes it so it isn't lost.
    */
   deal_updated: boolean;
+  /** The deal's previous link, if it was still unpaid and we cancelled it first. */
+  cancelled_previous_link_id?: string;
 }
 
 /**
@@ -98,6 +100,7 @@ export const ErrorCodes = [
   "INVALID_SIGNATURE", // webhook signature check failed
   "NOT_FOUND", // no such route
   "ALREADY_IN_PROGRESS", // a link for this deal is being created right now (double click)
+  "ALREADY_PAID", // the deal's current link is already (partly) paid; no new link, to avoid charging twice
   "DEAL_NOT_FOUND",
   "INVALID_AMOUNT", // no amount, zero or negative
   "RAZORPAY_REJECTED", // Razorpay said no: bad amount, invalid customer data, auth failure

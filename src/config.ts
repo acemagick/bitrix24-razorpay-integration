@@ -108,6 +108,10 @@ const envSchema = z.object({
   // Where we remember which webhook events we've already processed (idempotency).
   PROCESSED_EVENTS_PATH: z.string().default("data/processed_events.json"),
 
+  // Where we remember payment links that were created but could neither be saved
+  // to the deal nor cancelled, so they block new links even after a restart.
+  UNRESOLVED_LINKS_PATH: z.string().default("data/unresolved_links.json"),
+
   // HTTP port for the Express server.
   PORT: z.coerce.number().int().min(1).max(65535).default(8000),
 });
@@ -127,6 +131,7 @@ export interface Config {
   razorpayAcceptPartial: boolean;
   paymentLinkExpireDays: number | undefined;
   processedEventsPath: string;
+  unresolvedLinksPath: string;
   port: number;
 }
 
@@ -161,6 +166,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     razorpayAcceptPartial: e.RAZORPAY_ACCEPT_PARTIAL,
     paymentLinkExpireDays: e.PAYMENT_LINK_EXPIRE_DAYS,
     processedEventsPath: e.PROCESSED_EVENTS_PATH,
+    unresolvedLinksPath: e.UNRESOLVED_LINKS_PATH,
     port: e.PORT,
   };
 }

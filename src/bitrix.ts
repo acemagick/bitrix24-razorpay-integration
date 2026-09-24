@@ -82,10 +82,16 @@ export interface DealInfo {
   /** Pipeline ID; "0" is the default pipeline. */
   categoryId: string;
   contact: ContactInfo | undefined;
+  /**
+   * The untouched deal from crm.deal.get, including custom UF_CRM_ fields.
+   * Their names depend on your portal (set in config), so this module can't
+   * give them proper names; callers read them from here.
+   */
+  raw: BitrixRecord;
 }
 
 /** A raw Bitrix record: string keys, values of unknown shape. */
-type BitrixRecord = Record<string, unknown>;
+export type BitrixRecord = Record<string, unknown>;
 
 // --------------------------------------------------------------------------- client
 
@@ -282,6 +288,7 @@ export class BitrixClient {
       currency: (nonEmptyString(deal.CURRENCY_ID) ?? "INR").toUpperCase(),
       categoryId: nonEmptyString(deal.CATEGORY_ID) ?? "0",
       contact,
+      raw: deal,
     };
   }
 

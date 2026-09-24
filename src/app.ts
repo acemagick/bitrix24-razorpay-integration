@@ -27,7 +27,7 @@ import {
   type HealthResponse,
   type WebhookAck,
 } from "./models.ts";
-import { FlowError, createPaymentLinkForDeal } from "./paymentLinks.ts";
+import { FlowError, createPaymentLinkForDeal, type UnresolvedLinkStore } from "./paymentLinks.ts";
 import type { RazorpayClient } from "./razorpay.ts";
 import { dedupeKey, processWebhook, verifySignature, type ProcessedEventStore } from "./webhookHandler.ts";
 
@@ -36,6 +36,7 @@ export interface AppDeps {
   bitrix: BitrixClient;
   razorpay: RazorpayClient;
   eventStore: ProcessedEventStore;
+  unresolvedLinks: UnresolvedLinkStore;
 }
 
 export interface CreatedApp {
@@ -48,7 +49,7 @@ export interface CreatedApp {
 }
 
 export function createApp(deps: AppDeps): CreatedApp {
-  const { config, bitrix, razorpay, eventStore } = deps;
+  const { config, bitrix, razorpay, eventStore, unresolvedLinks } = deps;
   const app = express();
 
   // Webhook processing still running after its 200 reply has been sent.
@@ -90,7 +91,7 @@ export function createApp(deps: AppDeps): CreatedApp {
     }
 
     try {
-      const result = await createPaymentLinkForDeal(dealId, { config, bitrix, razorpay });
+      const result = await createPaymentLinkForDeal(dealId, { config, bitrix, razorpay, unresolvedLinks });
       res.status(201).json(result); // 201 Created: a new resource (the link) exists now
     } catch (err) {
       if (err instanceof FlowError) {

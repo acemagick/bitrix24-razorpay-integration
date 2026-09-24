@@ -186,10 +186,14 @@ export class RazorpayClient {
   /**
    * Create a payment link for a deal, choosing the first free reference_id.
    *
-   * WHY the retry loop: Razorpay allows each reference_id only once, forever,
-   * even after the old link expired or was cancelled. The first link for deal
-   * 123 gets "123"; if that's taken we try "123-2", "123-3"... The webhook
-   * handler strips the suffix (and prefers notes.bitrix_deal_id anyway).
+   * WHY the retry loop: Razorpay refuses a reference_id that another link is
+   * still using. The first link for deal 123 gets "123"; if that's taken we try
+   * "123-2", "123-3"... The webhook handler strips the suffix (and prefers
+   * notes.bitrix_deal_id anyway).
+   *
+   * Seen in test mode: a CANCELLED link frees its reference_id, so it can be
+   * reused. Two links can therefore share "123-2", but only one of them can
+   * still be paid. That's harmless: payments are matched by notes.bitrix_deal_id.
    *
    * Only DuplicateReferenceError triggers a retry. Any other error (bad amount,
    * auth failure, network) is thrown straight away.
@@ -221,6 +225,20 @@ export class RazorpayClient {
    */
   async fetchOrder(orderId: string): Promise<RazorpayOrder> {
     return this.request<RazorpayOrder>("GET", `/orders/${encodeURIComponent(orderId)}`);
+  }
+
+  /** Fetch a payment link by id, e.g. to check whether it has been paid. */
+  async fetchPaymentLink(linkId: string): Promise<PaymentLink> {
+    return this.request<PaymentLink>("GET", `/payment_links/${encodeURIComponent(linkId)}`);
+  }
+
+  /**
+   * Cancel a payment link so the customer can no longer pay with it.
+   * Razorpay only allows this for links that aren't paid, expired or already
+   * cancelled; otherwise it answers with an error.
+   */
+  async cancelPaymentLink(linkId: string): Promise<PaymentLink> {
+    return this.request<PaymentLink>("POST", `/payment_links/${encodeURIComponent(linkId)}/cancel`);
   }
 
   /**
