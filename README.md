@@ -272,18 +272,23 @@ The script checks the answers and exits with code 1 if anything is unexpected. B
 Instead of calling the service by hand, let Bitrix24 call it when a deal enters a stage, e.g. your **Payment Link** stage.
 
 1. Set `INBOUND_API_TOKEN` in `.env` first, and restart the service. The URL below becomes public.
-2. In **CRM → Deals**, open **Automation rules** (top right of the Kanban view).
-3. In the **Payment Link** column, click **Add** and choose the **Webhook** rule (under *Other*; some versions call it *Outgoing webhook*).
-4. Set the URL to:
+2. Print the URL for the rule, with your token filled in. Run this from the project folder, replacing the address with your public one, and **don't share the output**:
+   ```bash
+   node -e "const t=require('node:util').parseEnv(require('fs').readFileSync('.env','utf8')).INBOUND_API_TOKEN; console.log('https://<your public address>/payment-links?deal_id={{ID}}&token='+t)"
    ```
-   https://<your public address>/payment-links?deal_id={{ID}}&token=<your INBOUND_API_TOKEN>
-   ```
-   Use the rule's **…** / insert-field button to insert the deal's **ID** in place of `{{ID}}`.
-5. Save.
+3. In **CRM → Deals**, open **Automation rules** (top right of the Kanban view).
+4. In the **Payment Link** column, click **Add**, search for **webhook**, and add **Outbound webhook**. (Not *Track inbound webhook*: that's a trigger, which works the other way round.)
+5. In the rule's settings:
+   - **Execution:** change *Wait / 1 day* to **Immediately**.
+   - **Handler:** paste the URL from step 2. Then delete `{{ID}}`, click **•••** next to the box, and choose **Deal → ID**. The URL then contains `deal_id={=Document:ID}`.
+   - **Condition:** leave empty.
+6. Click **Save** on the rule, then **Save** on the automation rules page.
 
-Moving a deal into that stage now creates its link. The link appears in the deal's field, with a timeline comment.
+Moving a deal into that stage now creates its link within seconds. The link appears in the deal's fields, with a timeline comment. If the deal's current link is already paid, no new link is created, and a comment says so.
 
-The service accepts the deal ID from the `?deal_id=` query string, from a JSON body (`{"deal_id": 54}`), or from Bitrix's business-process format (`document_id[2]=DEAL_54`). That last one means it still finds the deal if the rule sends its own document data. This automation rule hasn't been tried on a real portal yet; see [open checks](#known-limitations-and-open-checks).
+The service accepts the deal ID from the `?deal_id=` query string (what this rule sends), from a JSON body (`{"deal_id": 54}`), or from Bitrix's business-process format (`document_id[2]=DEAL_54`).
+
+The service must be running and reachable when a deal enters the stage. Deals moved while it's down (e.g. your computer is off while testing with ngrok) don't get a link. Move them out of the stage and back in once it's up again.
 
 ---
 
@@ -441,12 +446,13 @@ npm start
 - The `54-2` reference retry
 - Cancelling the previous unpaid link
 - A real successful payment arriving by webhook, and its comment
+- The **Outbound webhook** automation rule on the *Payment Link* stage creating links automatically
+- The `409 ALREADY_PAID` refusal when a deal whose link is paid re-enters the stage
 
 **Not yet verified with a real payment:**
 1. **`payment.failed` with a real payload.** A real failure webhook may not include our `bitrix_deal_id` note. The service then fetches the order from Razorpay. If neither has it, the failure is logged but **no comment appears** (it's never put on a wrong deal). Test with `failure@razorpay` and check which source the log line `payment.failed -> deal 54 (found via …)` names.
-2. **Resend / duplicate, cancelled comment, and the `409 ALREADY_PAID` refusal.** Covered by automated tests against a fake Razorpay, but not yet tried against the real one.
-3. **The Bitrix24 automation rule** calling `/payment-links`. Its exact request format hasn't been seen yet; the service accepts all three known formats.
-4. **Razorpay's wording for "this link ID doesn't exist"** was assumed. If it differs, that case stops with an error instead of going ahead: safe, but it would need a fix.
+2. **Resend / duplicate and the cancelled comment.** Covered by automated tests against a fake Razorpay, but not yet tried against the real one.
+3. **Razorpay's wording for "this link ID doesn't exist"** was assumed. If it differs, that case stops with an error instead of going ahead: safe, but it would need a fix.
 
 **Limitations:**
 - **Two-decimal currencies only.** Amounts are multiplied by 100. That's right for INR and most currencies, but not for zero-decimal (JPY) or three-decimal (KWD, BHD) ones.
