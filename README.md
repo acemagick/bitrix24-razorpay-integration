@@ -448,11 +448,13 @@ npm start
 - A real successful payment arriving by webhook, and its comment
 - The **Outbound webhook** automation rule on the *Payment Link* stage creating links automatically
 - The `409 ALREADY_PAID` refusal when a deal whose link is paid re-enters the stage
+- A deal re-entering the stage: its unpaid link is cancelled and a new one created
+- A real **failed payment** (Netbanking → Failure): Razorpay copies the link's notes onto the payment, so the deal is found directly (`found via payment.notes`), and the comment includes the bank's reason
+- A real **cancelled** webhook and its comment
 
-**Not yet verified with a real payment:**
-1. **`payment.failed` with a real payload.** A real failure webhook may not include our `bitrix_deal_id` note. The service then fetches the order from Razorpay. If neither has it, the failure is logged but **no comment appears** (it's never put on a wrong deal). Test with `failure@razorpay` and check which source the log line `payment.failed -> deal 54 (found via …)` names.
-2. **Resend / duplicate and the cancelled comment.** Covered by automated tests against a fake Razorpay, but not yet tried against the real one.
-3. **Razorpay's wording for "this link ID doesn't exist"** was assumed. If it differs, that case stops with an error instead of going ahead: safe, but it would need a fix.
+**Not yet verified against the real Razorpay:**
+1. **Resend / duplicate protection.** Covered by automated tests, but not yet tried with Razorpay's **Resend** button.
+2. **Razorpay's wording for "this link ID doesn't exist"** was assumed. If it differs, that case stops with an error instead of going ahead: safe, but it would need a fix.
 
 **Limitations:**
 - **Two-decimal currencies only.** Amounts are multiplied by 100. That's right for INR and most currencies, but not for zero-decimal (JPY) or three-decimal (KWD, BHD) ones.
