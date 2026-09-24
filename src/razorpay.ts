@@ -322,7 +322,8 @@ export function formatMoney(paise: number, currency: string): string {
   try {
     return new Intl.NumberFormat("en-IN", { style: "currency", currency }).format(major);
   } catch {
-    // Intl throws RangeError for currency codes it doesn't know.
+    // Intl throws RangeError for malformed currency codes (e.g. "RUPEE", "rs").
+    // A well-formed but unknown code like "XYZ" doesn't throw; it's printed as-is.
     return `${currency} ${major.toFixed(2)}`;
   }
 }
