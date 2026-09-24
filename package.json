@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "list-fields": "tsx scripts/listFields.ts",
-    "check-setup": "tsx scripts/checkSetup.ts"
+    "check-setup": "tsx scripts/checkSetup.ts",
+    "send-webhook": "tsx scripts/sendTestWebhook.ts"
   },
   "repository": {
     "type": "git",

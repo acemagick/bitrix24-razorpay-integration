@@ -93,8 +93,11 @@ export interface CreateLinkResponse {
  * just `string`, so a typo in an error code is a compile error.
  */
 export const ErrorCodes = [
-  "BAD_REQUEST", // missing or invalid deal_id
+  "BAD_REQUEST", // missing or invalid deal_id, malformed JSON
   "UNAUTHORIZED", // wrong or missing ?token=
+  "INVALID_SIGNATURE", // webhook signature check failed
+  "NOT_FOUND", // no such route
+  "ALREADY_IN_PROGRESS", // a link for this deal is being created right now (double click)
   "DEAL_NOT_FOUND",
   "INVALID_AMOUNT", // no amount, zero or negative
   "RAZORPAY_REJECTED", // Razorpay said no: bad amount, invalid customer data, auth failure
