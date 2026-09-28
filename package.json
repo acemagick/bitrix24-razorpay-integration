@@ -11,6 +11,8 @@
     "dev": "tsx watch src/main.ts",
     "build": "tsc",
     "start": "node dist/src/main.js",
+    "build:lambda": "node scripts/buildLambda.mjs",
+    "deploy": "npm run build:lambda && sam deploy",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/test.mjs",
     "list-fields": "tsx scripts/listFields.ts",
@@ -35,8 +37,10 @@
     "@types/big.js": "^7.0.0",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.2",
+    "esbuild": "^0.28.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.1"
+    "vitest": "^5.0.1",
+    "yaml": "^2.9.1"
   }
 }

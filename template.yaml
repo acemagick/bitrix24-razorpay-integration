@@ -1,0 +1,152 @@
+# What AWS should create for this service. `sam deploy` reads this file.
+#
+#   npm run build:lambda   pack the code into dist-lambda/lambda.js
+#   sam deploy --guided    first time: asks for the settings below, then creates everything
+#   sam deploy             later deploys (the answers are remembered in samconfig.toml)
+#
+# Don't run `sam build`: the code is already built by `npm run build:lambda`.
+#
+# What gets created (together called a "stack", named at the first deploy):
+#   - PaymentLinksFunction   the Lambda function that runs src/lambda.ts
+#   - its Function URL       the public HTTPS address for Bitrix and Razorpay
+#   - Table                  the DynamoDB table (the shared "notebook")
+#   - LogGroup               where the logs go (CloudWatch), kept 30 days
+#   - a role (permission) letting the function use that table and write logs
+
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Bitrix24 <-> Razorpay payment links (Lambda + DynamoDB)
+
+# ----------------------------------------------------------------------------- settings
+# The same settings as in .env. `sam deploy --guided` asks for each one.
+# NoEcho: CloudFormation hides the value in its console and logs. (It is still
+# visible to anyone who can open the function's configuration in the Lambda console.)
+Parameters:
+  BitrixWebhookUrl:
+    Type: String
+    NoEcho: true
+    Description: Bitrix24 inbound webhook URL, e.g. https://yourcompany.bitrix24.in/rest/1/abc123/
+  BitrixPaymentLinkField:
+    Type: String
+    AllowedPattern: "UF_CRM_\\w+"
+    Description: API name of the deal field for the payment link URL (UF_CRM_...)
+  BitrixPaymentIdField:
+    Type: String
+    AllowedPattern: "UF_CRM_\\w+"
+    Description: API name of the deal field for the Razorpay link ID (UF_CRM_...)
+  RazorpayKeyId:
+    Type: String
+    AllowedPattern: "rzp_(test|live)_\\w+"
+    Description: Razorpay key ID (rzp_test_... or rzp_live_...)
+  RazorpayKeySecret:
+    Type: String
+    NoEcho: true
+    Description: Razorpay key secret
+  RazorpayWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: The secret you type when creating the webhook in the Razorpay dashboard
+  InboundApiToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Long random string; Bitrix must send it as ?token=... (required, because the URL is public)
+  MoveDealToWon:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Move the deal to Won when its link is fully paid
+  RazorpayAcceptPartial:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Let customers pay in parts
+  PaymentLinkExpireDays:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[1-9][0-9]*$"
+    Description: Days until a link expires; empty = never
+
+# ----------------------------------------------------------------------------- resources
+Resources:
+  # The shared notebook. One key, `pk`; rows delete themselves after `expiresAt`.
+  # PAY_PER_REQUEST: no fixed capacity to pay for, costs pennies at this volume.
+  Table:
+    Type: AWS::DynamoDB::Table
+    # Keep the table (and any unresolved links in it) even if the stack is deleted.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      # Lets you restore the table to any second of the last 35 days.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  PaymentLinksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Creates Razorpay payment links for Bitrix24 deals and handles Razorpay webhooks
+      CodeUri: dist-lambda/
+      Handler: lambda.handler # the `handler` export of dist-lambda/lambda.js
+      Runtime: nodejs24.x # serverless-express needs Node 24
+      Architectures: [arm64] # AWS Graviton: cheaper, and fine for Node
+      MemorySize: 512
+      # Creating a link takes ~3-4 s (Bitrix + Razorpay); 30 s leaves plenty of room.
+      Timeout: 30
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      Environment:
+        Variables:
+          BITRIX_WEBHOOK_URL: !Ref BitrixWebhookUrl
+          BITRIX_PAYMENT_LINK_FIELD: !Ref BitrixPaymentLinkField
+          BITRIX_PAYMENT_ID_FIELD: !Ref BitrixPaymentIdField
+          RAZORPAY_KEY_ID: !Ref RazorpayKeyId
+          RAZORPAY_KEY_SECRET: !Ref RazorpayKeySecret
+          RAZORPAY_WEBHOOK_SECRET: !Ref RazorpayWebhookSecret
+          INBOUND_API_TOKEN: !Ref InboundApiToken
+          MOVE_DEAL_TO_WON: !Ref MoveDealToWon
+          RAZORPAY_ACCEPT_PARTIAL: !Ref RazorpayAcceptPartial
+          PAYMENT_LINK_EXPIRE_DAYS: !Ref PaymentLinkExpireDays
+          DYNAMODB_TABLE: !Ref Table
+          # Error messages in the logs point at the TypeScript source lines.
+          NODE_OPTIONS: --enable-source-maps
+      # Permission to read and write THIS table only.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+      # A public HTTPS address. "NONE" = no AWS login needed to call it, because
+      # Bitrix and Razorpay can't log in to AWS. The service protects itself:
+      # /payment-links needs INBOUND_API_TOKEN, webhooks need Razorpay's signature.
+      FunctionUrlConfig:
+        AuthType: NONE
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-payment-links
+      RetentionInDays: 30
+
+# ----------------------------------------------------------------------------- outputs
+# Printed at the end of every deploy.
+Outputs:
+  FunctionUrl:
+    Description: The service's address. Use it in the Bitrix automation rule and the Razorpay webhook.
+    Value: !GetAtt PaymentLinksFunctionUrl.FunctionUrl
+  RazorpayWebhookUrl:
+    Description: Paste this into Razorpay -> Webhooks
+    Value: !Sub "${PaymentLinksFunctionUrl.FunctionUrl}webhooks/razorpay"
+  TableName:
+    Description: The DynamoDB table
+    Value: !Ref Table
+  Logs:
+    Description: Where to read the logs (CloudWatch)
+    Value: !Ref LogGroup

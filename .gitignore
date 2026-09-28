@@ -10,3 +10,9 @@ data/
 
 # Old Python version, kept locally for reference only
 python-reference/
+
+# AWS Lambda build and deploy output
+dist-lambda/
+.aws-sam/
+# sam deploy --guided saves your answers here, which can include secrets
+samconfig.toml
