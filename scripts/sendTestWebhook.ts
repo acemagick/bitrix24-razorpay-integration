@@ -172,13 +172,24 @@ function expectedAck(i: number): string | undefined {
   return i === 1 ? "accepted" : "duplicate";
 }
 
+const send = () =>
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Razorpay-Signature": signature, "X-Razorpay-Event-Id": eventId },
+    body,
+  });
+
 for (let i = 1; i <= (values.twice ? 2 : 1); i++) {
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Razorpay-Signature": signature, "X-Razorpay-Event-Id": eventId },
-      body,
-    });
+    let response = await send();
+    // The --twice resend can arrive while the first is still being processed.
+    // The server then answers 409 ALREADY_IN_PROGRESS, and Razorpay would try
+    // again later; do the same, a little faster.
+    for (let retry = 1; i > 1 && response.status === 409 && retry <= 10; retry++) {
+      console.log(`Send #${i}: HTTP 409, the first send is still being processed; retrying in 1s`);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      response = await send();
+    }
     const text = await response.text();
     let ack: unknown;
     try {

@@ -83,6 +83,16 @@ export function dedupeKey(eventIdHeader: string | undefined, webhook: RazorpayWe
 export class ProcessedEventStore {
   // A Map remembers insertion order, so the first key is always the oldest.
   private readonly seen = new Map<string, string>(); // event id -> ISO time processed
+  // Claimed but not finished yet. Memory only: if the process dies mid-work,
+  // the event was never processed, so a resend must be handled again.
+  private readonly inProgress = new Set<string>();
+  // Processed, but not on disk yet (save pending or failed). A restart would
+  // forget these, so they aren't reported as durable duplicates; see ensureSaved().
+  // Maps event id -> the completion's generation, so a save that captured an
+  // earlier completion can't clear the marker of a newer one (an id that was
+  // dropped from `seen` and then processed again).
+  private readonly unsaved = new Map<string, number>();
+  private generation = 0;
   private writeChain: Promise<void> = Promise.resolve();
   private readonly path: string;
   private readonly maxEntries: number;
@@ -113,26 +123,56 @@ export class ProcessedEventStore {
   }
 
   /**
-   * Record an event ID. Returns true if it's new (process it), false if it's a
-   * duplicate (skip it).
+   * Claim an event before processing it. Returns true if it's new (process it,
+   * then call complete() or release()), false if it's already processed or
+   * still being processed (use has() to tell which).
    *
    * WHY check and record in one step: Razorpay can send the same event twice
    * almost at once. Because Node runs our code on one thread, the check and the
    * record below happen with nothing in between (there's no `await` between
    * them), so two simultaneous deliveries can't both see "new".
+   *
+   * The claim is NOT saved to disk: only complete() does that, so an event whose
+   * processing never finished isn't remembered as done.
    */
   claim(eventId: string): boolean {
-    if (this.seen.has(eventId)) return false;
+    if (this.seen.has(eventId) || this.inProgress.has(eventId)) return false;
+    this.inProgress.add(eventId);
+    return true;
+  }
+
+  /**
+   * The claimed event has been processed: remember it for good. It counts as
+   * processed in memory straight away; the returned promise resolves once that's
+   * on disk, and rejects if the save failed (the failure is also logged).
+   */
+  complete(eventId: string): Promise<void> {
+    this.inProgress.delete(eventId);
     this.seen.set(eventId, new Date().toISOString());
+    this.unsaved.set(eventId, ++this.generation);
     while (this.seen.size > this.maxEntries) {
       const oldest = this.seen.keys().next().value;
       if (oldest === undefined) break;
       this.seen.delete(oldest);
+      this.unsaved.delete(oldest);
     }
-    this.persist();
-    return true;
+    return this.persist();
   }
 
+  /**
+   * Resolves once a processed event is on disk, saving again if its earlier
+   * save failed (or is still pending); rejects if it still can't be saved.
+   */
+  ensureSaved(eventId: string): Promise<void> {
+    return this.unsaved.has(eventId) ? this.persist() : Promise.resolve();
+  }
+
+  /** Processing of the claimed event didn't finish: forget the claim, so a resend is processed. */
+  release(eventId: string): void {
+    this.inProgress.delete(eventId);
+  }
+
+  /** True if the event has been fully processed (not necessarily on disk yet: see ensureSaved()). */
   has(eventId: string): boolean {
     return this.seen.has(eventId);
   }
@@ -143,28 +183,37 @@ export class ProcessedEventStore {
   }
 
   /**
-   * Save to disk in the background.
+   * Save to disk, and return this save's own result (rejects if it failed).
+   * Callers may ignore it: the failure is logged here, and the chain below
+   * handles the rejection, so an ignored one can't become an unhandled rejection.
    *
    * Saves are chained one after another so two writes never overlap and
    * interleave. Each one writes a temp file and renames it over the real file,
    * so a crash mid-write can't leave a half-written, corrupt file.
    */
-  private persist(): void {
+  private persist(): Promise<void> {
     const snapshot = JSON.stringify([...this.seen.entries()]);
-    this.writeChain = this.writeChain
-      .then(async () => {
-        await mkdir(dirname(this.path), { recursive: true });
-        const tmp = `${this.path}.tmp`;
-        await writeFile(tmp, snapshot, "utf8");
-        try {
-          await rename(tmp, this.path);
-        } catch {
-          // On Windows, rename can fail with EPERM if another process (often
-          // antivirus) has the file open. Fall back to writing directly.
-          await writeFile(this.path, snapshot, "utf8");
-        }
-      })
-      .catch((err) => console.error(`[webhook] Could not save processed events to ${this.path}`, err));
+    // Every unsaved id is in `seen`, so in this snapshot; remember which completion.
+    const captured = [...this.unsaved.entries()];
+    const write = this.writeChain.then(async () => {
+      await mkdir(dirname(this.path), { recursive: true });
+      const tmp = `${this.path}.tmp`;
+      await writeFile(tmp, snapshot, "utf8");
+      try {
+        await rename(tmp, this.path);
+      } catch {
+        // On Windows, rename can fail with EPERM if another process (often
+        // antivirus) has the file open. Fall back to writing directly.
+        await writeFile(this.path, snapshot, "utf8");
+      }
+      // These completions are on disk now, unless the id has been completed again since.
+      for (const [id, generation] of captured) {
+        if (this.unsaved.get(id) === generation) this.unsaved.delete(id);
+      }
+    });
+    // Keep the chain going after a failure.
+    this.writeChain = write.catch((err) => console.error(`[webhook] Could not save processed events to ${this.path}`, err));
+    return write;
   }
 }
 

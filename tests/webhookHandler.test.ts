@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -69,31 +69,79 @@ describe("dedupeKey", () => {
 });
 
 describe("ProcessedEventStore", () => {
-  it("says yes the first time and no for a repeat", async () => {
+  it("says yes the first time and no for a repeat, whether in progress or done", async () => {
     const store = new ProcessedEventStore(join(await makeTempDir(), "events.json"));
     expect(store.claim("evt_1")).toBe(true);
     expect(store.claim("evt_1")).toBe(false);
+    expect(store.has("evt_1")).toBe(false); // claimed, not processed yet
+    store.complete("evt_1");
+    expect(store.claim("evt_1")).toBe(false);
+    expect(store.has("evt_1")).toBe(true);
     expect(store.claim("evt_2")).toBe(true);
-    // claim() saves in the background; wait for it, or the temp folder cleanup
+    // complete() saves in the background; wait for it, or the temp folder cleanup
     // races with the write (a flaky ENOTEMPTY on Windows).
     await store.flush();
   });
 
-  it("remembers events across a restart", async () => {
+  it("retries a failed save when asked to make sure a processed event is on disk", async () => {
+    const blocker = join(await makeTempDir(), "not-a-folder");
+    await writeFile(blocker, ""); // a file where the folder should be: saves fail
+    const path = join(blocker, "events.json");
+    const store = new ProcessedEventStore(path);
+    store.claim("evt_1");
+    await expect(store.complete("evt_1")).rejects.toThrow();
+    expect(store.has("evt_1")).toBe(true); // processed, just not on disk
+    await expect(store.ensureSaved("evt_1")).rejects.toThrow();
+
+    await rm(blocker);
+    await expect(store.ensureSaved("evt_1")).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(path, "utf8")).map(([id]: [string]) => id)).toEqual(["evt_1"]);
+    await expect(store.ensureSaved("evt_1")).resolves.toBeUndefined(); // nothing left to save
+  });
+
+  it("doesn't let an earlier save clear a newer completion's unsaved marker", async () => {
+    // With room for one ID: A is saved, dropped for B, then processed again.
+    const store = new ProcessedEventStore(join(await makeTempDir(), "events.json"), 1);
+    // Looked at directly: from outside, the marker only shows up as timing.
+    const unsaved = (store as unknown as { unsaved: Map<string, number> }).unsaved;
+    store.claim("A");
+    const firstSave = store.complete("A"); // save 1: [A]
+    store.claim("B");
+    void store.complete("B"); // A dropped; save 2: [B]
+    store.claim("A");
+    void store.complete("A"); // A again; save 3: [A]
+
+    await firstSave; // saves 2 and 3 haven't run yet
+    expect(unsaved.has("A")).toBe(true); // save 1 was the OLD completion of A
+    await store.flush();
+    expect(unsaved.size).toBe(0);
+  });
+
+  it("lets a released claim be processed again", () => {
+    const store = new ProcessedEventStore("unused.json");
+    expect(store.claim("evt_1")).toBe(true);
+    store.release("evt_1");
+    expect(store.claim("evt_1")).toBe(true);
+  });
+
+  it("remembers completed events across a restart, but not unfinished claims", async () => {
     const path = join(await makeTempDir(), "nested", "events.json"); // folder is created on first save
     const before = new ProcessedEventStore(path);
-    before.claim("evt_1");
+    before.claim("evt_done");
+    before.complete("evt_done");
+    before.claim("evt_unfinished"); // e.g. the process died while this one was being processed
     await before.flush();
 
     const after = new ProcessedEventStore(path);
     await after.load();
-    expect(after.claim("evt_1")).toBe(false);
+    expect(after.claim("evt_done")).toBe(false);
+    expect(after.claim("evt_unfinished")).toBe(true);
   });
 
   it("drops the oldest IDs beyond its limit", async () => {
     const path = join(await makeTempDir(), "events.json");
     const store = new ProcessedEventStore(path, 2);
-    for (const id of ["evt_1", "evt_2", "evt_3"]) store.claim(id);
+    for (const id of ["evt_1", "evt_2", "evt_3"]) store.complete(id);
     await store.flush();
     expect(JSON.parse(await readFile(path, "utf8")).map(([id]: [string]) => id)).toEqual(["evt_2", "evt_3"]);
     expect(store.has("evt_1")).toBe(false);

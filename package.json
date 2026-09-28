@@ -12,7 +12,7 @@
     "build": "tsc",
     "start": "node dist/src/main.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "node scripts/test.mjs",
     "list-fields": "tsx scripts/listFields.ts",
     "check-setup": "tsx scripts/checkSetup.ts",
     "send-webhook": "tsx scripts/sendTestWebhook.ts"

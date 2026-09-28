@@ -316,7 +316,7 @@ Two requests for the same deal at the same time (a double click, or a rule firin
 
 1. **Verify the signature** before anything else: HMAC-SHA256 of the **raw** request body with `RAZORPAY_WEBHOOK_SECRET`, compared in constant time. A mismatch gets HTTP 400 and nothing else happens. The raw bytes matter: parsing the JSON and re-serialising it would change the spacing and break the signature.
 2. **Parse** the event. Events not on the list are answered `ignored`.
-3. **Skip duplicates.** Razorpay may deliver an event more than once. Each `X-Razorpay-Event-Id` is remembered in `data/processed_events.json`, which survives restarts, and a repeat is answered `duplicate`.
+3. **Skip duplicates.** Razorpay may deliver an event more than once. Each `X-Razorpay-Event-Id` is remembered in `data/processed_events.json`, which survives restarts, and a repeat is answered `duplicate`. An event only counts as processed once its Bitrix work has finished: a repeat that arrives while the first delivery is still being processed gets HTTP 409, so Razorpay retries it later, and an event whose processing never finished (e.g. the process was stopped) is processed again when resent.
 4. **Answer HTTP 200 immediately**, then do the Bitrix work in the background. Razorpay retries anything that isn't a quick 2xx, so a slow or broken CRM must never delay the answer. Failures are logged instead.
 5. **Find the deal** from `notes.bitrix_deal_id`: on the payment link, on the payment, on the order, or, as a last resort for `payment.failed`, by fetching the order from Razorpay. The note is only a claim: the service then **checks that the event's link is the one saved in that deal's Link ID field** (or one it created but couldn't save). For `payment.failed`, which names no link, the payment's order must be the order of that link. Notes copied onto another link or payment, and links created by hand in the dashboard, are never matched to a deal, even if their reference looks like a deal ID. Payments that match no deal (e.g. your website's checkout) are skipped.
 6. **Comment** on the deal:
@@ -396,6 +396,7 @@ The deal ID can be sent in the query string (`?deal_id=54`), as JSON (`{"deal_id
 | 200 | `{"status":"accepted"}` | Valid and new; processing in the background |
 | 200 | `{"status":"duplicate"}` | Already processed |
 | 200 | `{"status":"ignored"}` | An event we don't handle, or a payload we can't read |
+| 409 | `ALREADY_IN_PROGRESS` | The same event is still being processed; Razorpay retries later |
 | 400 | `INVALID_SIGNATURE` | Signature missing or wrong |
 
 ---
@@ -477,6 +478,7 @@ npm start
 | Comment "The customer has already paid …" | Working as intended (`ALREADY_PAID`). For a genuine second payment, clear the deal's *Razorpay Link ID* field. |
 | Comment "… could not be saved to the deal, so it was cancelled" | Usually a required deal field is empty (e.g. *Purpose*). Fill it in and retry. |
 | Changed `.env` but nothing changed | Restart `npm run dev`; it doesn't reload `.env`. |
+| Every test file fails with `Vitest failed to find the runner` | You ran `npx vitest` from a terminal whose path starts with a lowercase `c:\` (a vitest bug on Windows). Use `npm test`, which corrects the drive letter first. |
 | Service refuses to start: `Could not read data/unresolved_links.json` | The file is damaged. Check the Razorpay dashboard for any link it might list, cancel it if needed, then delete the file. |
 
 The service logs one line per request (`[http] …`) and one per important step (`[payment-links] …`, `[webhook] …`). Secrets and the `?token=` value are never logged.

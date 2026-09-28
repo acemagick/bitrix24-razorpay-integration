@@ -37,6 +37,16 @@ export interface AppDeps {
   razorpay: RazorpayClient;
   eventStore: ProcessedEventStore;
   unresolvedLinks: UnresolvedLinkStore;
+  /**
+   * true: finish the Bitrix work for a webhook BEFORE answering Razorpay.
+   * false (default): answer Razorpay at once and do the work in the background.
+   *
+   * WHY the switch: on a normal server, answering first is best (a slow CRM
+   * never makes Razorpay wait). On AWS Lambda it's impossible: Lambda freezes
+   * the function as soon as the answer is sent, so background work may never
+   * finish. The Lambda entry point turns this on; main.ts leaves it off.
+   */
+  processWebhooksInline?: boolean;
 }
 
 export interface CreatedApp {
@@ -49,7 +59,7 @@ export interface CreatedApp {
 }
 
 export function createApp(deps: AppDeps): CreatedApp {
-  const { config, bitrix, razorpay, eventStore, unresolvedLinks } = deps;
+  const { config, bitrix, razorpay, eventStore, unresolvedLinks, processWebhooksInline = false } = deps;
   const app = express();
 
   // Webhook processing still running after its 200 reply has been sent.
@@ -106,7 +116,7 @@ export function createApp(deps: AppDeps): CreatedApp {
   // express.raw() gives us req.body as a Buffer of the exact bytes received.
   // `type: "*/*"` accepts any Content-Type, so a missing or odd header can't make
   // the body silently disappear.
-  app.post("/webhooks/razorpay", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
+  app.post("/webhooks/razorpay", express.raw({ type: "*/*", limit: "1mb" }), async (req, res) => {
     const rawBody: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
 
     // ---- 1. Signature: before ANYTHING else, including JSON parsing.
@@ -141,30 +151,80 @@ export function createApp(deps: AppDeps): CreatedApp {
     // ---- 3. Duplicate check
     const key = dedupeKey(req.get("x-razorpay-event-id"), webhook);
     if (!eventStore.claim(key)) {
-      console.info(`[webhook] Duplicate ${webhook.event} (${key}), already processed`);
-      return res.json({ status: "duplicate" } satisfies WebhookAck);
+      if (eventStore.has(key)) {
+        // Only a duplicate once that's on disk: if an earlier save failed, retry
+        // it, and if it fails again, ask Razorpay to resend rather than say "done".
+        try {
+          await eventStore.ensureSaved(key);
+        } catch {
+          // Already logged by the store.
+          return sendError(res, 500, "INTERNAL_ERROR", "Already processed, but could not record it. Retry later.");
+        }
+        console.info(`[webhook] Duplicate ${webhook.event} (${key}), already processed`);
+        return res.json({ status: "duplicate" } satisfies WebhookAck);
+      }
+      // An earlier delivery is still being processed and might not finish, so
+      // this isn't a duplicate yet. A non-2xx makes Razorpay send it again later:
+      // by then it's either done ("duplicate") or released (processed again).
+      console.info(`[webhook] ${webhook.event} (${key}) is still being processed; asking Razorpay to retry later`);
+      return sendError(res, 409, "ALREADY_IN_PROGRESS", "This event is still being processed. Retry later.");
     }
 
-    // ---- 4. Answer 200 NOW, then do the slow work.
-    // WHY: Razorpay waits only a few seconds, and treats anything but 2xx (or a
-    // timeout) as a failure and retries, for up to 24 hours. Talking to Bitrix
-    // can be slow. Replying first means a slow or broken CRM never causes
-    // retries; problems are logged instead.
-    res.json({ status: "accepted" } satisfies WebhookAck);
-
-    // Not awaited on purpose: this keeps running after the response is sent.
-    // processWebhook never throws; the .catch is a belt-and-braces guard,
-    // because an unhandled rejection would crash the process.
-    // The promise is remembered until it settles, so shutdown can wait for it.
-    const work = processWebhook(webhook, {
+    // ---- 4. Do the Bitrix work (post the comment, maybe move to Won).
+    // Only once it has finished is the event remembered as processed. processWebhook
+    // never throws; if it somehow does, the claim is released so a resend is
+    // processed again.
+    const processing = processWebhook(webhook, {
       bitrix,
       razorpay,
       linkIdField: config.bitrixPaymentIdField,
       unresolvedLinks,
       moveDealToWon: config.moveDealToWon,
-    }).then(
-      () => undefined,
-      (err) => console.error("[webhook] processWebhook threw unexpectedly", err),
+    });
+    const failed = (err: unknown) => {
+      console.error("[webhook] processWebhook threw unexpectedly", err);
+      eventStore.release(key);
+    };
+
+    if (processWebhooksInline) {
+      // ---- 5a. Lambda: finish first, THEN answer.
+      // If Bitrix is slow and Razorpay gives up waiting, it sends the event again:
+      // while this is still running that resend is asked to retry later, and once
+      // it has finished it's answered "duplicate", so the comment is posted once.
+      // If Lambda is stopped before the work finishes, nothing was recorded, so
+      // the resend is processed.
+      try {
+        await processing;
+      } catch (err) {
+        failed(err);
+        return sendError(res, 500, "INTERNAL_ERROR", "Processing failed. Retry later.");
+      }
+      // Lambda may freeze as soon as we answer, so the record must be on disk
+      // before the 200, or a resend reaching a fresh instance is processed again.
+      try {
+        await eventStore.complete(key);
+      } catch {
+        // Already logged by the store. The work is done and this instance knows it:
+        // Razorpay's resend of this non-2xx retries the save, and is answered
+        // "duplicate" once it succeeds (without repeating the Bitrix work).
+        return sendError(res, 500, "INTERNAL_ERROR", "Processed, but could not record it. Retry later.");
+      }
+      return res.json({ status: "accepted" } satisfies WebhookAck);
+    }
+
+    // ---- 5b. Normal server: answer 200 NOW; the work above carries on.
+    // WHY: Razorpay waits only a few seconds, and treats anything but 2xx (or a
+    // timeout) as a failure and retries, for up to 24 hours. Talking to Bitrix
+    // can be slow. Replying first means a slow or broken CRM never causes
+    // retries; problems are logged instead.
+    res.json({ status: "accepted" } satisfies WebhookAck);
+    // The record is saved in the background. The work counts as running until
+    // that save has settled, and shutdown waits for it (drain()). A failed save
+    // is logged by the store; the event was still processed, so it isn't released
+    // (a resend retries the save instead).
+    const work = processing.then(
+      () => eventStore.complete(key).catch(() => undefined),
+      failed,
     );
     backgroundWork.add(work);
     void work.finally(() => backgroundWork.delete(work));

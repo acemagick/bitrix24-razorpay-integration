@@ -4,7 +4,7 @@
  */
 
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,9 +13,23 @@ import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createApp } from "../src/app.ts";
 import { UnresolvedLinkStore } from "../src/paymentLinks.ts";
 import { ProcessedEventStore } from "../src/webhookHandler.ts";
-import { createFakeBitrix, createFakeRazorpay, deal, json, linkEntity, paymentEntity, sign, testConfig, webhookBody } from "./helpers.ts";
+import {
+  createFakeBitrix,
+  createFakeRazorpay,
+  deal,
+  json,
+  linkEntity,
+  makeTempDir,
+  paymentEntity,
+  sign,
+  testConfig,
+  webhookBody,
+} from "./helpers.ts";
 
-async function startApp(env: Record<string, string> = {}) {
+async function startApp(
+  env: Record<string, string> = {},
+  options: { processWebhooksInline?: boolean; eventStore?: ProcessedEventStore } = {},
+) {
   const bitrix = createFakeBitrix();
   const rzp = createFakeRazorpay();
   bitrix.deals.set("54", deal());
@@ -25,7 +39,14 @@ async function startApp(env: Record<string, string> = {}) {
   const dir = await mkdtemp(join(tmpdir(), "b24rzp-app-"));
   const eventStore = new ProcessedEventStore(join(dir, "events.json"));
   const unresolvedLinks = new UnresolvedLinkStore(join(dir, "unresolved.json"));
-  const { app, drain } = createApp({ config: testConfig(env), bitrix: bitrix.client, razorpay: rzp.client, eventStore, unresolvedLinks });
+  const { app, drain } = createApp({
+    config: testConfig(env),
+    bitrix: bitrix.client,
+    razorpay: rzp.client,
+    eventStore,
+    unresolvedLinks,
+    ...options,
+  });
 
   const server = app.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -183,6 +204,7 @@ describe("POST /webhooks/razorpay", () => {
     const { base, bitrix, drain } = await startApp();
 
     const first = await postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
+    await drain(); // the first has finished its Bitrix work, so it now counts as processed
     const second = await postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
 
     expect(await first.json()).toEqual({ status: "accepted" });
@@ -228,6 +250,109 @@ describe("POST /webhooks/razorpay", () => {
     releaseComment();
     await drain();
     expect(commentFinished).toBe(true);
+  });
+
+  it("drain() also waits for the event to be saved as processed", async () => {
+    const path = join(await makeTempDir(), "events.json");
+    const eventStore = new ProcessedEventStore(path);
+    const { base, drain } = await startApp({}, { eventStore });
+
+    await postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
+    await drain();
+
+    expect(JSON.parse(await readFile(path, "utf8")).map(([id]: [string]) => id)).toEqual(["evt_1"]);
+  });
+
+  describe("with processWebhooksInline (AWS Lambda)", () => {
+    /** Make Bitrix's comment call hang until the test releases it. */
+    function slowComments(bitrix: ReturnType<typeof createFakeBitrix>) {
+      const state = { finished: 0, release: () => {} };
+      const gate = new Promise<void>((resolve) => (state.release = resolve));
+      bitrix.failOn("crm.timeline.comment.add", async () => {
+        await gate;
+        state.finished++;
+        return json(200, { result: 1 });
+      });
+      return state;
+    }
+
+    it("finishes the Bitrix work BEFORE answering Razorpay", async () => {
+      const { base, bitrix } = await startApp({}, { processWebhooksInline: true });
+      const comments = slowComments(bitrix);
+
+      const pending = postWebhook(base, paidBody);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      comments.release();
+      const response = await pending;
+
+      // By the time Razorpay has its answer, the comment is already posted:
+      // nothing is left running in the background for Lambda to freeze.
+      expect(await response.json()).toEqual({ status: "accepted" });
+      expect(comments.finished).toBe(1);
+    });
+
+    it("asks a resend that arrives while the first is still working to retry, then answers 'duplicate'", async () => {
+      const { base, bitrix } = await startApp({}, { processWebhooksInline: true });
+      const comments = slowComments(bitrix);
+
+      const first = postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
+      await new Promise((resolve) => setTimeout(resolve, 50)); // first is now waiting on Bitrix
+      // Not "duplicate" yet: the first might never finish (e.g. Lambda times out),
+      // so a non-2xx makes Razorpay send it again later.
+      const second = await postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
+      expect(second.status).toBe(409);
+      expect(await second.json()).toMatchObject({ error_code: "ALREADY_IN_PROGRESS" });
+
+      comments.release();
+      expect(await (await first).json()).toEqual({ status: "accepted" });
+      const third = await postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
+      expect(await third.json()).toEqual({ status: "duplicate" });
+      expect(bitrix.comments("42")).toHaveLength(1);
+    });
+
+    it("has the event saved as processed before answering 200", async () => {
+      // Lambda may freeze right after answering, so the save can't be left for later.
+      const path = join(await makeTempDir(), "events.json");
+      const eventStore = new ProcessedEventStore(path);
+      const { base } = await startApp({}, { processWebhooksInline: true, eventStore });
+
+      const response = await postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
+
+      expect(await response.json()).toEqual({ status: "accepted" });
+      expect(JSON.parse(await readFile(path, "utf8")).map(([id]: [string]) => id)).toEqual(["evt_1"]);
+    });
+
+    it("answers 500 until the record can be saved, then 'duplicate', without redoing the work", async () => {
+      // A folder that can't be created (a file is in the way), so every save fails.
+      const blocker = join(await makeTempDir(), "not-a-folder");
+      await writeFile(blocker, "");
+      const path = join(blocker, "events.json");
+      const eventStore = new ProcessedEventStore(path);
+      const { base, bitrix } = await startApp({}, { processWebhooksInline: true, eventStore });
+
+      const first = await postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
+      expect(first.status).toBe(500);
+      expect(await first.json()).toMatchObject({ error_code: "INTERNAL_ERROR" });
+
+      // Razorpay retries the non-2xx. Still can't save: not acknowledged as a duplicate.
+      const stillFailing = await postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
+      expect(stillFailing.status).toBe(500);
+
+      // Disk fixed: the resend saves the record and only then says "duplicate".
+      await rm(blocker);
+      const resend = await postWebhook(base, paidBody, { "X-Razorpay-Event-Id": "evt_1" });
+      expect(await resend.json()).toEqual({ status: "duplicate" });
+      expect(JSON.parse(await readFile(path, "utf8")).map(([id]: [string]) => id)).toEqual(["evt_1"]);
+      expect(bitrix.comments("42")).toHaveLength(1);
+    });
+
+    it("still answers 200 when Bitrix is down, so Razorpay doesn't keep retrying", async () => {
+      const { base, bitrix } = await startApp({}, { processWebhooksInline: true });
+      bitrix.failOn("crm.timeline.comment.add", () => new Response("<html>down</html>", { status: 503 }));
+      const response = await postWebhook(base, paidBody);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ status: "accepted" });
+    });
   });
 });
 
