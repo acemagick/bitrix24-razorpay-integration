@@ -8,9 +8,8 @@
 import { createApp } from "./app.ts";
 import { BitrixClient } from "./bitrix.ts";
 import { getConfig } from "./config.ts";
-import { UnresolvedLinkStore } from "./paymentLinks.ts";
+import { createStorage, type Storage } from "./createStorage.ts";
 import { RazorpayClient } from "./razorpay.ts";
-import { ProcessedEventStore } from "./webhookHandler.ts";
 
 // A missing or invalid .env should produce a readable message, not a stack trace.
 let config;
@@ -23,21 +22,28 @@ try {
 
 const bitrix = new BitrixClient(config.bitrixWebhookUrl);
 const razorpay = new RazorpayClient(config.razorpayKeyId, config.razorpayKeySecret.reveal());
-const eventStore = new ProcessedEventStore(config.processedEventsPath);
-await eventStore.load(); // before accepting webhooks, so restarts remember past events
-const unresolvedLinks = new UnresolvedLinkStore(config.unresolvedLinksPath);
+let storage: Storage;
 try {
-  await unresolvedLinks.load(); // before accepting requests, so restarts remember possibly payable links
+  // Files by default; DynamoDB if DYNAMODB_TABLE is set (see createStorage.ts).
+  storage = await createStorage(config);
 } catch (err) {
   console.error(`[server] Could not read ${config.unresolvedLinksPath}. Fix or remove it before starting.`, err);
   process.exit(1);
 }
 
-const { app, drain } = createApp({ config, bitrix, razorpay, eventStore, unresolvedLinks });
+const { app, drain } = createApp({
+  config,
+  bitrix,
+  razorpay,
+  eventStore: storage.eventStore,
+  unresolvedLinks: storage.unresolvedLinks,
+  dealLock: storage.dealLock,
+});
 
 const server = app.listen(config.port, () => {
   const mode = config.razorpayKeyId.startsWith("rzp_test_") ? "TEST" : "LIVE";
   console.info(`[server] Listening on http://localhost:${config.port} (Razorpay ${mode} mode)`);
+  console.info(`[server] Storage: ${storage.description}`);
   if (!config.inboundApiToken) {
     console.warn("[server] INBOUND_API_TOKEN is not set: anyone who can reach /payment-links can create links.");
   }
@@ -67,9 +73,8 @@ async function shutdown(signal: string) {
     // No new requests can arrive now. Wait for webhooks already being processed
     // (their 200 was sent, but their Bitrix comment may still be in progress).
     await drain();
-    await eventStore.flush();
     try {
-      await unresolvedLinks.flush();
+      await storage.flush();
     } catch (err) {
       console.error("[server] Could not save unresolved payment links", err);
       process.exit(1);

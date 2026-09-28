@@ -23,6 +23,8 @@
   },
   "license": "ISC",
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1141.0",
+    "@aws-sdk/lib-dynamodb": "^3.1141.0",
     "big.js": "^7.0.1",
     "express": "^5.2.1",
     "zod": "^4.6.5"

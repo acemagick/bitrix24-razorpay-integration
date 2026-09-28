@@ -27,16 +27,21 @@ import {
   type HealthResponse,
   type WebhookAck,
 } from "./models.ts";
-import { FlowError, createPaymentLinkForDeal, type UnresolvedLinkStore } from "./paymentLinks.ts";
+import { FlowError, createPaymentLinkForDeal } from "./paymentLinks.ts";
 import type { RazorpayClient } from "./razorpay.ts";
-import { dedupeKey, processWebhook, verifySignature, type ProcessedEventStore } from "./webhookHandler.ts";
+import type { DealLock, EventStore, UnresolvedLinkRecords } from "./storage.ts";
+import { dedupeKey, processWebhook, verifySignature } from "./webhookHandler.ts";
 
 export interface AppDeps {
   config: Config;
   bitrix: BitrixClient;
   razorpay: RazorpayClient;
-  eventStore: ProcessedEventStore;
-  unresolvedLinks: UnresolvedLinkStore;
+  // What the service remembers: files on a normal server, DynamoDB on Lambda
+  // (see storage.ts and createStorage.ts).
+  eventStore: EventStore;
+  unresolvedLinks: UnresolvedLinkRecords;
+  /** Defaults to an in-memory lock, right for a single server. */
+  dealLock?: DealLock;
   /**
    * true: finish the Bitrix work for a webhook BEFORE answering Razorpay.
    * false (default): answer Razorpay at once and do the work in the background.
@@ -59,7 +64,7 @@ export interface CreatedApp {
 }
 
 export function createApp(deps: AppDeps): CreatedApp {
-  const { config, bitrix, razorpay, eventStore, unresolvedLinks, processWebhooksInline = false } = deps;
+  const { config, bitrix, razorpay, eventStore, unresolvedLinks, dealLock, processWebhooksInline = false } = deps;
   const app = express();
 
   // Webhook processing still running after its 200 reply has been sent.
@@ -101,7 +106,7 @@ export function createApp(deps: AppDeps): CreatedApp {
     }
 
     try {
-      const result = await createPaymentLinkForDeal(dealId, { config, bitrix, razorpay, unresolvedLinks });
+      const result = await createPaymentLinkForDeal(dealId, { config, bitrix, razorpay, unresolvedLinks, dealLock });
       res.status(201).json(result); // 201 Created: a new resource (the link) exists now
     } catch (err) {
       if (err instanceof FlowError) {
@@ -150,8 +155,19 @@ export function createApp(deps: AppDeps): CreatedApp {
 
     // ---- 3. Duplicate check
     const key = dedupeKey(req.get("x-razorpay-event-id"), webhook);
-    if (!eventStore.claim(key)) {
-      if (eventStore.has(key)) {
+    let claimed: boolean;
+    let alreadyDone = false;
+    try {
+      claimed = await eventStore.claim(key);
+      if (!claimed) alreadyDone = await eventStore.has(key);
+    } catch (err) {
+      // The database is unreachable, so we can't tell a resend from a new event.
+      // A non-2xx makes Razorpay send it again later, when it's hopefully back.
+      console.error(`[webhook] Could not check ${webhook.event} (${key}) for duplicates`, err);
+      return sendError(res, 503, "STORAGE_UNAVAILABLE", "Could not check this event. Retry later.");
+    }
+    if (!claimed) {
+      if (alreadyDone) {
         // Only a duplicate once that's on disk: if an earlier save failed, retry
         // it, and if it fails again, ask Razorpay to resend rather than say "done".
         try {
@@ -183,7 +199,11 @@ export function createApp(deps: AppDeps): CreatedApp {
     });
     const failed = (err: unknown) => {
       console.error("[webhook] processWebhook threw unexpectedly", err);
-      eventStore.release(key);
+      // If releasing fails too (database unreachable), the claim runs out by
+      // itself after a few minutes, and a resend is then handled again.
+      Promise.resolve()
+        .then(() => eventStore.release(key))
+        .catch((releaseErr) => console.error(`[webhook] Could not release ${key}`, releaseErr));
     };
 
     if (processWebhooksInline) {

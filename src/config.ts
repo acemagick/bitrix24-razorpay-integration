@@ -112,6 +112,11 @@ const envSchema = z.object({
   // to the deal nor cancelled, so they block new links even after a restart.
   UNRESOLVED_LINKS_PATH: z.string().default("data/unresolved_links.json"),
 
+  // Name of a DynamoDB table. If set, everything the service remembers goes there
+  // instead of the two files above: needed on AWS Lambda, which has no permanent
+  // disk and may run several copies at once. Leave empty on a normal server.
+  DYNAMODB_TABLE: z.string().trim().min(1).optional(),
+
   // HTTP port for the Express server.
   PORT: z.coerce.number().int().min(1).max(65535).default(8000),
 });
@@ -132,6 +137,7 @@ export interface Config {
   paymentLinkExpireDays: number | undefined;
   processedEventsPath: string;
   unresolvedLinksPath: string;
+  dynamodbTable: string | undefined;
   port: number;
 }
 
@@ -167,6 +173,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     paymentLinkExpireDays: e.PAYMENT_LINK_EXPIRE_DAYS,
     processedEventsPath: e.PROCESSED_EVENTS_PATH,
     unresolvedLinksPath: e.UNRESOLVED_LINKS_PATH,
+    dynamodbTable: e.DYNAMODB_TABLE,
     port: e.PORT,
   };
 }

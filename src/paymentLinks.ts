@@ -32,6 +32,7 @@ import {
   toPaise,
   type RazorpayClient,
 } from "./razorpay.ts";
+import { MemoryDealLock, StorageError, type DealLock, type UnresolvedLinkRecords } from "./storage.ts";
 
 /** A failure with everything the route needs to answer the caller. */
 export class FlowError extends Error {
@@ -52,16 +53,22 @@ export interface PaymentLinkDeps {
   config: Pick<Config, "bitrixPaymentLinkField" | "bitrixPaymentIdField" | "razorpayAcceptPartial" | "paymentLinkExpireDays">;
   bitrix: Pick<BitrixClient, "getDealWithContact" | "updateDeal" | "safeComment">;
   razorpay: Pick<RazorpayClient, "createPaymentLinkForDeal" | "fetchPaymentLink" | "cancelPaymentLink">;
-  unresolvedLinks: UnresolvedLinkStore;
+  unresolvedLinks: UnresolvedLinkRecords;
+  /**
+   * The "a link is being created for this deal right now" lock.
+   *
+   * WHY: if someone double-clicks, or a Bitrix robot fires twice, two requests for
+   * the same deal arrive together. Both would reach Razorpay, the second would get
+   * "reference_id already exists", and our retry would happily create link "54-2".
+   * Result: two live links for one deal. The lock stops the second request early.
+   *
+   * Defaults to one shared in-memory lock, right for a single server. On Lambda
+   * the DynamoDB lock is passed in, so separate copies see each other's locks.
+   */
+  dealLock?: DealLock;
 }
 
-// Deals that have a link being created right now.
-//
-// WHY: if someone double-clicks, or a Bitrix robot fires twice, two requests for
-// the same deal arrive together. Both would reach Razorpay, the second would get
-// "reference_id already exists", and our retry would happily create link "54-2".
-// Result: two live links for one deal. This set stops the second request early.
-const inFlight = new Set<string>();
+const defaultDealLock = new MemoryDealLock();
 
 /**
  * Remembers, per deal, a link we created but could neither save to the deal nor
@@ -73,9 +80,9 @@ const inFlight = new Set<string>();
  *
  * WHY A FILE (not just memory): so a restart doesn't forget a link that may
  * still be payable. Like ProcessedEventStore, it's fine for one server instance;
- * with several, move it into a shared database.
+ * on AWS Lambda, DynamoUnresolvedLinks (dynamoStorage.ts) is used instead.
  */
-export class UnresolvedLinkStore {
+export class UnresolvedLinkStore implements UnresolvedLinkRecords {
   private readonly links = new Map<string, string>(); // deal id -> link id
   private writeChain: Promise<void> = Promise.resolve();
   private lastSave: Promise<void> = Promise.resolve();
@@ -150,23 +157,40 @@ export class UnresolvedLinkStore {
 
 /** Run flow 1 for one deal. Throws FlowError on any expected failure. */
 export async function createPaymentLinkForDeal(dealId: string, deps: PaymentLinkDeps): Promise<CreateLinkResponse> {
-  if (inFlight.has(dealId)) {
-    // No timeline comment: the first request is still running and will comment itself.
-    throw new FlowError(409, "ALREADY_IN_PROGRESS", `A payment link for deal ${dealId} is already being created`, dealId);
-  }
-  inFlight.add(dealId);
-  try {
-    return await runFlow(dealId, deps);
-  } catch (err) {
-    const flowError = toFlowError(err, dealId);
+  const lock = deps.dealLock ?? defaultDealLock;
+  const report = async (flowError: FlowError) => {
     // Report on the deal, except when there's no deal to report on.
     if (flowError.code !== "DEAL_NOT_FOUND") {
       await deps.bitrix.safeComment(dealId, `Razorpay: Could not create payment link\n${flowError.message}`);
     }
-    throw flowError;
+    return flowError;
+  };
+
+  let locked: boolean;
+  try {
+    locked = await lock.acquire(dealId);
+  } catch (err) {
+    // Without the lock we can't rule out a second link, so don't start.
+    throw await report(toFlowError(err, dealId));
+  }
+  if (!locked) {
+    // No timeline comment: the first request is still running and will comment itself.
+    throw new FlowError(409, "ALREADY_IN_PROGRESS", `A payment link for deal ${dealId} is already being created`, dealId);
+  }
+
+  try {
+    return await runFlow(dealId, deps);
+  } catch (err) {
+    throw await report(toFlowError(err, dealId));
   } finally {
     // `finally` runs whether we returned or threw, so the lock is always released.
-    inFlight.delete(dealId);
+    // If releasing fails (storage unreachable), the lock runs out by itself
+    // after a minute (see dynamoStorage.ts), so just log it.
+    try {
+      await lock.release(dealId);
+    } catch (err) {
+      console.error(`[payment-links] Deal ${dealId}: could not release the lock`, err);
+    }
   }
 }
 
@@ -193,7 +217,7 @@ async function runFlow(dealId: string, deps: PaymentLinkDeps): Promise<CreateLin
   // It stays recorded (and keeps blocking new links) until it's cancelled, found
   // unusable, or the team puts its ID into the deal's field by hand. From then on
   // the field tracks it like any other link.
-  const unresolvedLinkId = unresolvedLinks.get(dealId);
+  const unresolvedLinkId = await unresolvedLinks.get(dealId);
   if (unresolvedLinkId && unresolvedLinkId !== previousLinkId) {
     await retirePreviousLink(
       dealId,
@@ -457,6 +481,15 @@ function toFlowError(err: unknown, dealId: string): FlowError {
       // link and only the reply was lost. Warn before someone retries blindly.
       `Razorpay could not be reached: ${err.message}\n` +
         "A link may still have been created. Check the Razorpay dashboard (Payment Links) before trying again.",
+      dealId,
+      { cause: err },
+    );
+  }
+  if (err instanceof StorageError) {
+    return new FlowError(
+      503,
+      "STORAGE_UNAVAILABLE",
+      `The integration could not reach its database, so no new link was created. Try again in a minute.\n(${err.message})`,
       dealId,
       { cause: err },
     );

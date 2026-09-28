@@ -17,8 +17,8 @@ import { dirname } from "node:path";
 
 import type { BitrixClient } from "./bitrix.ts";
 import { isHandledEvent, type RazorpayWebhook } from "./models.ts";
-import type { UnresolvedLinkStore } from "./paymentLinks.ts";
 import { formatMoney, type RazorpayClient } from "./razorpay.ts";
+import type { EventStore, UnresolvedLinkRecords } from "./storage.ts";
 
 // =========================================================================== 1. signature
 
@@ -74,13 +74,14 @@ export function dedupeKey(eventIdHeader: string | undefined, webhook: RazorpayWe
  * would get two identical "Payment successful" comments.
  *
  * WHY A FILE (not just memory): so a restart of the service doesn't forget
- * everything. It's deliberately simple: fine for one server instance. If you
- * run several instances, move this into a shared database or Redis.
+ * everything. It's deliberately simple: fine for one server instance. On AWS
+ * Lambda (no permanent disk, several copies at once) DynamoEventStore in
+ * dynamoStorage.ts is used instead; both follow the EventStore contract.
  *
  * The oldest entries are dropped after `maxEntries`. Razorpay only retries for
  * about 24 hours, so very old IDs are no longer needed.
  */
-export class ProcessedEventStore {
+export class ProcessedEventStore implements EventStore {
   // A Map remembers insertion order, so the first key is always the oldest.
   private readonly seen = new Map<string, string>(); // event id -> ISO time processed
   // Claimed but not finished yet. Memory only: if the process dies mid-work,
@@ -232,7 +233,7 @@ export interface DealLookupDeps {
   /** The deal field where this service saves each deal's current link ID (BITRIX_PAYMENT_ID_FIELD). */
   linkIdField: string;
   /** Links this service created but couldn't save to their deal. */
-  unresolvedLinks: Pick<UnresolvedLinkStore, "get">;
+  unresolvedLinks: Pick<UnresolvedLinkRecords, "get">;
 }
 
 /**
@@ -333,9 +334,15 @@ async function isRecordedLink(
     console.warn(`[webhook] Could not load deal ${dealId} to check its payment link: ${(err as Error).message}`);
     return false;
   }
-  const recorded = [String(deal[deps.linkIdField] ?? "").trim(), deps.unresolvedLinks.get(dealId)].filter(
-    (id): id is string => !!id,
-  );
+  let unresolved: string | undefined;
+  try {
+    unresolved = await deps.unresolvedLinks.get(dealId);
+  } catch (err) {
+    // Storage unreachable: judge by the deal's field alone. A payment on an
+    // unsaved link then gets no comment, which is safer than guessing.
+    console.warn(`[webhook] Could not read the unresolved link of deal ${dealId}: ${(err as Error).message}`);
+  }
+  const recorded = [String(deal[deps.linkIdField] ?? "").trim(), unresolved].filter((id): id is string => !!id);
 
   if (linkId) return recorded.includes(linkId);
   if (!orderId) return false;

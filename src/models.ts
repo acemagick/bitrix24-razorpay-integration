@@ -107,6 +107,7 @@ export const ErrorCodes = [
   "RAZORPAY_UNAVAILABLE", // couldn't reach Razorpay
   "BITRIX_ERROR", // Bitrix answered with an error
   "BITRIX_UNAVAILABLE", // couldn't reach Bitrix
+  "STORAGE_UNAVAILABLE", // couldn't reach the service's own database (DynamoDB on Lambda)
   "INTERNAL_ERROR", // a bug in our code
 ] as const;
 export type ErrorCode = (typeof ErrorCodes)[number];

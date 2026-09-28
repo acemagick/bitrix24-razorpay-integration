@@ -10,7 +10,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { createApp } from "../src/app.ts";
+import { createApp, type AppDeps } from "../src/app.ts";
+import { StorageError } from "../src/storage.ts";
 import { UnresolvedLinkStore } from "../src/paymentLinks.ts";
 import { ProcessedEventStore } from "../src/webhookHandler.ts";
 import {
@@ -28,7 +29,7 @@ import {
 
 async function startApp(
   env: Record<string, string> = {},
-  options: { processWebhooksInline?: boolean; eventStore?: ProcessedEventStore } = {},
+  options: Partial<Pick<AppDeps, "processWebhooksInline" | "eventStore" | "dealLock">> = {},
 ) {
   const bitrix = createFakeBitrix();
   const rzp = createFakeRazorpay();
@@ -372,5 +373,39 @@ describe("GET /bitrix/deal-fields", () => {
     const { base } = await startApp({ INBOUND_API_TOKEN: "s3cret" });
     expect((await fetch(`${base}/bitrix/deal-fields`)).status).toBe(401);
     expect((await fetch(`${base}/bitrix/deal-fields?token=s3cret`)).status).toBe(200);
+  });
+});
+
+// --------------------------------------------------------------------------- database down
+
+describe("when the service's database (DynamoDB on Lambda) can't be reached", () => {
+  const down = () => {
+    throw new StorageError("DynamoDB table test: could not reach it: connect ETIMEDOUT");
+  };
+
+  it("answers a webhook with 503, so Razorpay sends it again later instead of it being lost", async () => {
+    const { base, bitrix, drain } = await startApp(
+      {},
+      { eventStore: { claim: down, has: down, complete: async () => {}, ensureSaved: async () => {}, release: () => {} } },
+    );
+    const body = webhookBody("payment_link.paid", { payment_link: linkEntity({ amount_paid: 149_999 }), payment: paymentEntity() });
+
+    const response = await postWebhook(base, body);
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error_code: "STORAGE_UNAVAILABLE" });
+    await drain();
+    expect(bitrix.comments("42")).toEqual([]); // nothing done, so the retry can do it properly
+  });
+
+  it("refuses to create a link (it can't rule out a double click) and says so on the deal", async () => {
+    const { base, bitrix, rzp } = await startApp({}, { dealLock: { acquire: down, release: () => {} } });
+
+    const response = await fetch(`${base}/payment-links?deal_id=54`, { method: "POST" });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error_code: "STORAGE_UNAVAILABLE" });
+    expect(rzp.calls).toEqual([]);
+    expect(bitrix.comments("54")[0]).toContain("could not reach its database, so no new link was created");
   });
 });
