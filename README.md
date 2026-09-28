@@ -7,6 +7,8 @@ A small Node.js service that connects Bitrix24 CRM deals with Razorpay payment l
 
 Every problem (no amount, Razorpay rejected the request, Bitrix unreachable…) ends up as a **timeline comment on the deal**, so the sales team sees it inside the CRM rather than only in server logs.
 
+**Where it runs:** in production on **AWS Lambda**, with a DynamoDB table as its memory ([Deploying to AWS Lambda](#deploying-to-aws-lambda)). The same code also runs as a normal Node.js server, which is how you develop and test it on your own computer.
+
 ```
 Flow 1   Bitrix24 deal ──► POST /payment-links ──► Razorpay: create link
                                    │
@@ -27,20 +29,22 @@ Flow 2   Customer pays ──► Razorpay ──► POST /webhooks/razorpay ─�
 8. [Creating links automatically from a deal stage](#creating-links-automatically-from-a-deal-stage)
 9. [How it works](#how-it-works)
 10. [API reference](#api-reference)
-11. [Going live](#going-live)
-12. [Running in production](#running-in-production)
-13. [Known limitations and open checks](#known-limitations-and-open-checks)
-14. [Troubleshooting](#troubleshooting)
-15. [Project structure](#project-structure)
+11. [Deploying to AWS Lambda](#deploying-to-aws-lambda)
+12. [Going live](#going-live)
+13. [Running on your own server instead](#running-on-your-own-server-instead)
+14. [Known limitations and open checks](#known-limitations-and-open-checks)
+15. [Troubleshooting](#troubleshooting)
+16. [Project structure](#project-structure)
 
 ---
 
 ## Requirements
 
-- **Node.js 22 or newer** (`node --version`)
+- **Node.js 24** (`node --version`). The local server also runs on Node 22, but AWS Lambda uses Node 24.
 - A **Bitrix24** portal where you can create webhooks and custom fields (admin rights)
-- A **Razorpay** account. Everything here uses **Test Mode**, so no real money moves.
-- **ngrok** (free account), only for receiving Razorpay webhooks on your own computer
+- A **Razorpay** account. Everything here uses **Test Mode** unless stated otherwise, so no real money moves.
+- For deploying: an **AWS account**, plus the **AWS CLI** and **SAM CLI** ([setup](#one-time-setup))
+- **ngrok** (free account), only for receiving Razorpay webhooks on your own computer while testing locally
 
 ## Quick start
 
@@ -75,10 +79,12 @@ copy .env.example .env      # Windows cmd   (macOS/Linux/Git Bash: cp .env.examp
 | Command | What it does |
 |---|---|
 | `npm run dev` | Start the service for development. Restarts when a source file changes. **Does not reload `.env`**: restart it yourself after editing `.env`. |
-| `npm test` | Run the automated tests (about 150, a couple of seconds, no real accounts needed). |
+| `npm test` | Run the automated tests (about 200, a few seconds, no real accounts needed). |
 | `npm run typecheck` | Check TypeScript types without building. |
-| `npm run build` | Compile to JavaScript in `dist/`. |
-| `npm start` | Run the compiled service (after `npm run build`). Use this in production. |
+| `npm run build:lambda` | Pack the code for AWS Lambda into one file, `dist-lambda/lambda.js`. |
+| `npm run deploy` | Build for Lambda and deploy to AWS (after the [first deploy](#first-deploy)). |
+| `npm run build` | Compile to JavaScript in `dist/`, for [running on your own server](#running-on-your-own-server-instead). |
+| `npm start` | Run the compiled service on your own server (after `npm run build`). |
 | `npm run list-fields` | List the deal's custom `UF_CRM_…` fields. Only needs `BITRIX_WEBHOOK_URL`. Add `-- --all` for every field. |
 | `npm run check-setup [-- <dealId>]` | Read-only check of the whole setup, plus an optional dry run for one deal. |
 | `npm run send-webhook -- <event> <dealId>` | Send a fake, correctly signed Razorpay webhook to the running service ([details](#testing-without-a-razorpay-payment)). |
@@ -86,6 +92,8 @@ copy .env.example .env      # Windows cmd   (macOS/Linux/Git Bash: cp .env.examp
 ## Configuration
 
 All settings come from environment variables, usually through a `.env` file in the project folder. `.env` is in `.gitignore`: **never commit it**. Real environment variables take priority over `.env`.
+
+On **AWS Lambda** there is no `.env` file: you give the same values once during the [first deploy](#first-deploy), and AWS stores them as the function's settings. Keep your local `.env` matching them, because `npm run check-setup`, `list-fields` and `send-webhook` read `.env`.
 
 The service checks every value at startup and refuses to start, with a list of problems, if something is missing or wrong.
 
@@ -103,7 +111,8 @@ The service checks every value at startup and refuses to start, with a list of p
 | `PAYMENT_LINK_EXPIRE_DAYS` | no | `7` | Links expire after this many days. Empty means they never expire, so `payment_link.expired` never happens. |
 | `PROCESSED_EVENTS_PATH` | no | `data/processed_events.json` | Where processed webhook IDs are remembered (duplicate protection) |
 | `UNRESOLVED_LINKS_PATH` | no | `data/unresolved_links.json` | Where links that were created but couldn't be saved or cancelled are remembered |
-| `PORT` | no | `8000` | HTTP port |
+| `DYNAMODB_TABLE` | on Lambda only | set by the deploy | A DynamoDB table name. When set, everything above that says "remembered" is kept in DynamoDB instead of the two files. The deploy sets it automatically; leave it empty on your computer. |
+| `PORT` | no | `8000` | HTTP port (your own server only) |
 
 To generate a random value for `RAZORPAY_WEBHOOK_SECRET` or `INBOUND_API_TOKEN`:
 
@@ -271,24 +280,25 @@ The script checks the answers and exits with code 1 if anything is unexpected. B
 
 Instead of calling the service by hand, let Bitrix24 call it when a deal enters a stage, e.g. your **Payment Link** stage.
 
-1. Set `INBOUND_API_TOKEN` in `.env` first, and restart the service. The URL below becomes public.
-2. Print the URL for the rule, with your token filled in. Run this from the project folder, replacing the address with your public one, and **don't share the output**:
+1. Make sure `INBOUND_API_TOKEN` is set: on Lambda it's asked for during the deploy; locally, set it in `.env` and restart the service. The URL below becomes public.
+2. Put the rule's URL, with your token filled in, straight onto the **clipboard**. Run this from the project folder (Windows), replacing the address with your public one: on Lambda, the `FunctionUrl` from the deploy, without its final `/`.
    ```bash
-   node -e "const t=require('node:util').parseEnv(require('fs').readFileSync('.env','utf8')).INBOUND_API_TOKEN; console.log('https://<your public address>/payment-links?deal_id={{ID}}&token='+t)"
+   node -e "const t=require('node:util').parseEnv(require('fs').readFileSync('.env','utf8')).INBOUND_API_TOKEN; process.stdout.write('https://<your public address>/payment-links?deal_id=&token='+t)" | clip
    ```
+   The clipboard route matters: **copying a long line from the terminal can add line breaks** where the terminal wrapped it, and a URL with line breaks silently never reaches the service. It also keeps the token off the screen.
 3. In **CRM → Deals**, open **Automation rules** (top right of the Kanban view).
 4. In the **Payment Link** column, click **Add**, search for **webhook**, and add **Outbound webhook**. (Not *Track inbound webhook*: that's a trigger, which works the other way round.)
 5. In the rule's settings:
    - **Execution:** change *Wait / 1 day* to **Immediately**.
-   - **Handler:** paste the URL from step 2. Then delete `{{ID}}`, click **•••** next to the box, and choose **Deal → ID**. The URL then contains `deal_id={=Document:ID}`.
+   - **Handler:** click in the box, **Ctrl+A**, **Delete**, then **Ctrl+V**. Click right after `deal_id=`, click **•••** next to the box, and choose **Deal → ID**. Bitrix shows the inserted field as `{{ID}}`. That's correct, as long as it was inserted with •••, not typed.
    - **Condition:** leave empty.
 6. Click **Save** on the rule, then **Save** on the automation rules page.
 
-Moving a deal into that stage now creates its link within seconds. The link appears in the deal's fields, with a timeline comment. If the deal's current link is already paid, no new link is created, and a comment says so.
+Moving a deal into that stage now creates its link within seconds. The link appears in the deal's fields, with a timeline comment. If the deal's current link is already paid, no new link is created, and a comment says so. The rule only runs when a deal **enters** the stage: to retry, move the deal out and back in.
 
 The service accepts the deal ID from the `?deal_id=` query string (what this rule sends), from a JSON body (`{"deal_id": 54}`), or from Bitrix's business-process format (`document_id[2]=DEAL_54`).
 
-The service must be running and reachable when a deal enters the stage. Deals moved while it's down (e.g. your computer is off while testing with ngrok) don't get a link. Move them out of the stage and back in once it's up again.
+If nothing happens, check the logs ([Checking it works](#checking-it-works)). No `POST /payment-links` line at all means Bitrix never reached the service: the Handler address is wrong, has a line break, or wasn't saved. When testing locally, the service must also be running, and ngrok too.
 
 ---
 
@@ -307,17 +317,22 @@ The service must be running and reachable when a deal enters the stage. Deals mo
    - `reference_id` = the deal ID, or `54-2`, `54-3`… while earlier ones are still in use. The customer sees it as *RECEIPT*.
    - `notes.bitrix_deal_id` = the deal ID.
    - Razorpay's own SMS/email is switched off, because you send the link yourselves.
-5. **Save the link** on the deal (`crm.deal.update`: link URL and `plink_…` ID). If saving fails, the new link is **cancelled** so it can't be paid without the CRM knowing. If even that cancel fails, the link is recorded in `data/unresolved_links.json`, and no new link is created for that deal until it's dealt with.
+5. **Save the link** on the deal (`crm.deal.update`: link URL and `plink_…` ID). If saving fails, the new link is **cancelled** so it can't be paid without the CRM knowing. If even that cancel fails, the link is recorded as "unresolved" (in `data/unresolved_links.json`, or DynamoDB on Lambda), and no new link is created for that deal until it's dealt with.
 6. **Comment** on the deal's timeline (`crm.timeline.comment.add`).
 
-Two requests for the same deal at the same time (a double click, or a rule firing twice) are refused with `409 ALREADY_IN_PROGRESS`.
+Two requests for the same deal at the same time (a double click, or a rule firing twice) are refused with `409 ALREADY_IN_PROGRESS`. A per-deal lock makes sure of that. On Lambda the lock lives in DynamoDB, so it works even when the two requests reach two different copies of the function. It runs out by itself after a minute if it's never released.
 
 ### Flow 2: payment updates (`POST /webhooks/razorpay`)
 
 1. **Verify the signature** before anything else: HMAC-SHA256 of the **raw** request body with `RAZORPAY_WEBHOOK_SECRET`, compared in constant time. A mismatch gets HTTP 400 and nothing else happens. The raw bytes matter: parsing the JSON and re-serialising it would change the spacing and break the signature.
 2. **Parse** the event. Events not on the list are answered `ignored`.
-3. **Skip duplicates.** Razorpay may deliver an event more than once. Each `X-Razorpay-Event-Id` is remembered in `data/processed_events.json`, which survives restarts, and a repeat is answered `duplicate`. An event only counts as processed once its Bitrix work has finished: a repeat that arrives while the first delivery is still being processed gets HTTP 409, so Razorpay retries it later, and an event whose processing never finished (e.g. the process was stopped) is processed again when resent.
-4. **Answer HTTP 200 immediately**, then do the Bitrix work in the background. Razorpay retries anything that isn't a quick 2xx, so a slow or broken CRM must never delay the answer. Failures are logged instead.
+3. **Skip duplicates.** Razorpay may deliver an event more than once. Each `X-Razorpay-Event-Id` is remembered, and a repeat is answered `duplicate`. On your own server it's remembered in `data/processed_events.json`, which survives restarts. On Lambda it's remembered in DynamoDB, which every copy of the function shares, and handled IDs are kept 7 days (Razorpay resends for up to 24 hours).
+   - An event only counts as processed once its Bitrix work has finished. A repeat that arrives while the first delivery is still being processed gets HTTP 409, so Razorpay retries it later.
+   - An event whose processing never finished (e.g. the process or Lambda copy was stopped) is processed again when resent. On Lambda that's possible after 5 minutes, when its "processing" claim runs out.
+   - If the storage itself can't be reached, the answer is `503 STORAGE_UNAVAILABLE`, and Razorpay resends later.
+4. **Do the Bitrix work, and answer Razorpay.** The order differs:
+   - **Your own server** answers HTTP 200 **immediately**, then does the Bitrix work in the background. Razorpay retries anything that isn't a quick 2xx, so a slow or broken CRM must never delay the answer. Failures are logged instead.
+   - **AWS Lambda** does the Bitrix work **first**, then answers. Lambda freezes the function the moment it answers, so background work might never finish. If Bitrix is slow and Razorpay gives up waiting, its resend is recognised by step 3, so the comment is still posted only once.
 5. **Find the deal** from `notes.bitrix_deal_id`: on the payment link, on the payment, on the order, or, as a last resort for `payment.failed`, by fetching the order from Razorpay. The note is only a claim: the service then **checks that the event's link is the one saved in that deal's Link ID field** (or one it created but couldn't save). For `payment.failed`, which names no link, the payment's order must be the order of that link. Notes copied onto another link or payment, and links created by hand in the dashboard, are never matched to a deal, even if their reference looks like a deal ID. Payments that match no deal (e.g. your website's checkout) are skipped.
 6. **Comment** on the deal:
 
@@ -387,17 +402,144 @@ The deal ID can be sent in the query string (`?deal_id=54`), as JSON (`{"deal_id
 | 502 | `RAZORPAY_UNAVAILABLE` | Razorpay couldn't be reached. **A link may still have been created**, so check the dashboard before retrying. |
 | 502 | `BITRIX_ERROR` | Bitrix24 answered with an error |
 | 503 | `BITRIX_UNAVAILABLE` | Bitrix24 couldn't be reached |
+| 503 | `STORAGE_UNAVAILABLE` | The service's own storage (DynamoDB on Lambda) couldn't be reached. No link is created, because a double click can't be ruled out. Try again in a minute. |
 | 500 | `INTERNAL_ERROR` | A bug; details are in the server log |
 
 ### `POST /webhooks/razorpay`
 
 | HTTP | Body | Meaning |
 |---|---|---|
-| 200 | `{"status":"accepted"}` | Valid and new; processing in the background |
+| 200 | `{"status":"accepted"}` | Valid and new. On your own server it's being processed in the background; on Lambda it has already been processed. |
 | 200 | `{"status":"duplicate"}` | Already processed |
 | 200 | `{"status":"ignored"}` | An event we don't handle, or a payload we can't read |
 | 409 | `ALREADY_IN_PROGRESS` | The same event is still being processed; Razorpay retries later |
+| 503 | `STORAGE_UNAVAILABLE` | The duplicate check couldn't reach its storage; Razorpay retries later |
 | 400 | `INVALID_SIGNATURE` | Signature missing or wrong |
+
+---
+
+## Deploying to AWS Lambda
+
+In production the service runs on **AWS Lambda**: there's no server to keep running. AWS starts a copy of the code whenever a request arrives, and you pay only for that time, which at this volume is at or near AWS's free allowance.
+
+```
+Bitrix automation rule ─┐                         ┌─► Bitrix24 REST API
+                        ├─► Function URL (HTTPS) ─► Lambda ─┼─► Razorpay API
+Razorpay webhooks ──────┘                         └─► DynamoDB table (what the service remembers)
+```
+
+`template.yaml` describes everything AWS creates, as one **stack** named `bitrix24-razorpay`:
+- **the Lambda function** (Node 24, Mumbai region `ap-south-1`);
+- **its Function URL**: a permanent public HTTPS address, which replaces ngrok;
+- **a DynamoDB table** holding the duplicate records, unresolved links and deal locks. It is kept even if the stack is deleted, and it has 35 days of point-in-time recovery;
+- **a log group** in CloudWatch, keeping 30 days of logs;
+- **a permission (role)** letting the function use that table only.
+
+**Three things work differently on Lambda**, and the code switches them on automatically in `src/lambda.ts`:
+- Webhooks are processed **before** answering Razorpay ([why](#flow-2-payment-updates-post-webhooksrazorpay)).
+- Everything the service remembers lives in **DynamoDB**, not in files: Lambda has no permanent disk and may run several copies at once.
+- The double-click lock is in DynamoDB too, so separate copies see each other's locks.
+
+### One-time setup
+
+**1. A deploy user in AWS.** Don't deploy with the account's root login, because root access keys control the whole account. Log in to the AWS Console as root once, then:
+1. Set the region (top right) to **Asia Pacific (Mumbai)**.
+2. Go to **IAM → Users → Create user**, e.g. `bitrix24-razorpay-deployer`. Leave console access **off**.
+3. Choose **Attach policies directly** and tick:
+   - `AWSCloudFormationFullAccess`
+   - `AWSLambda_FullAccess`
+   - `AmazonDynamoDBFullAccess`
+   - `IAMFullAccess`
+   - `AmazonS3FullAccess`
+   - `CloudWatchLogsFullAccess`
+
+   Then **Create user**.
+4. Open the user → **Security credentials** → **Create access key** → *Command Line Interface (CLI)* → **Download .csv file**. The secret is shown only once; keep the file private.
+
+It's also a good idea to switch on **MFA** for the root login and stop using it day to day.
+
+**2. The tools**, on your computer:
+```bash
+winget install Amazon.AWSCLI
+winget install Amazon.SAM-CLI
+```
+Then close VS Code (or your terminal app) **completely** and reopen it, so the new commands are found.
+
+**3. Log in with the deploy user's keys:**
+```bash
+aws configure                 # access key ID, secret, region ap-south-1, output json
+aws sts get-caller-identity   # the Arn must end in user/<your deploy user>, not root
+```
+If `aws configure` asks about setting up AWS tools for AI coding agents, answer `n`.
+
+### First deploy
+
+```bash
+npm test                 # make sure everything passes first
+npm run build:lambda     # packs the code into dist-lambda/lambda.js
+sam deploy --guided
+```
+
+Don't run `sam build`: `npm run build:lambda` has already built the code. `sam deploy --guided` asks these questions:
+
+| It asks | Answer |
+|---|---|
+| Stack Name | `bitrix24-razorpay` |
+| AWS Region | `ap-south-1` |
+| BitrixWebhookUrl, BitrixPaymentLinkField, BitrixPaymentIdField, RazorpayKeyId, RazorpayKeySecret, RazorpayWebhookSecret, InboundApiToken | the same values as in your `.env`. `InboundApiToken` is **required** here, at least 16 characters. |
+| MoveDealToWon, RazorpayAcceptPartial, PaymentLinkExpireDays | **Enter** for the defaults, or your choice |
+| Confirm changes before deploy | `y` |
+| Allow SAM CLI IAM role creation | `Y` |
+| Disable rollback | `N` |
+| PaymentLinksFunction has no authentication. Is this okay? | `y`. Bitrix and Razorpay can't log in to AWS; the token and Razorpay's signature protect the service instead. |
+| Save arguments to configuration file | `Y`. The answers go into `samconfig.toml`, which is git-ignored because it contains secrets. |
+| SAM configuration file / environment | **Enter**, **Enter** |
+| Deploy this changeset? | `y` |
+
+**Secret values are invisible while you type or paste them.** Nothing appears, not even dots; that's normal. Paste **once**, then press Enter. If you're unsure, press Ctrl+C and start again: nothing is created until the last question.
+
+The first deploy also creates a small helper stack, `aws-sam-cli-managed-default`, which SAM uses to upload the code. When the deploy finishes, it prints **Outputs**:
+
+| Output | What it's for |
+|---|---|
+| `FunctionUrl` | the service's address, e.g. `https://abc123….lambda-url.ap-south-1.on.aws/` |
+| `RazorpayWebhookUrl` | the same address plus `webhooks/razorpay`: paste it into Razorpay |
+| `TableName` | the DynamoDB table |
+| `Logs` | the CloudWatch log group |
+
+### Point Bitrix and Razorpay at it
+
+1. **Bitrix automation rule:** set its Handler to `<FunctionUrl without the final />/payment-links?deal_id={{ID}}&token=…` ([how](#creating-links-automatically-from-a-deal-stage), including the clipboard step).
+2. **Razorpay webhook:** set its URL to the `RazorpayWebhookUrl` output. Keep the secret you gave as `RazorpayWebhookSecret`, and the five events.
+3. Stop any local `npm run dev` and ngrok. They're no longer needed.
+
+### Checking it works
+
+```bash
+curl.exe https://<FunctionUrl>/health        # {"status":"ok"}
+aws logs tail /aws/lambda/bitrix24-razorpay-payment-links --follow --region ap-south-1
+```
+
+The second command shows the logs live; press Ctrl+C to stop. Then move a test deal into *Payment Link* and pay its link with `success@razorpay`. The log shows `POST /payment-links -> 201`, then `POST /webhooks/razorpay -> 200`, and the deal gets both comments.
+
+You can also read the logs in the AWS Console: **CloudWatch → Log groups → `/aws/lambda/bitrix24-razorpay-payment-links`**. The first request after a quiet period includes a short start-up (`Init Duration`, about half a second).
+
+### Updating the code
+
+```bash
+npm test
+npm run deploy     # = npm run build:lambda + sam deploy, using the saved answers
+```
+
+It shows what will change and asks for confirmation. Commit to git first, so GitHub always matches what's running.
+
+### Changing a setting (e.g. new Razorpay keys)
+
+Run `npm run build:lambda`, then `sam deploy --guided` again, and give the new values. The answers are saved over the old ones in `samconfig.toml`. Saving a changed setting makes AWS start fresh copies of the function, so the new values apply straight away. Update your local `.env` to match.
+
+### Removing it
+
+`sam delete --stack-name bitrix24-razorpay --region ap-south-1` removes the function, URL, role and logs. The **DynamoDB table is kept** on purpose, since it may hold unresolved links; delete it in the DynamoDB console once you're sure.
 
 ---
 
@@ -407,23 +549,24 @@ The code is identical in test and live mode. **Only the settings change:**
 
 | What | Test mode | Live mode |
 |---|---|---|
-| `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` | `rzp_test_…` keys | `rzp_live_…` keys (Dashboard with **Test Mode off** → API Keys; needs an activated account) |
-| Razorpay webhook | added in Test Mode | added **again** in Live Mode, with its own secret |
-| `RAZORPAY_WEBHOOK_SECRET` | test webhook's secret | live webhook's secret |
-| Public address | ngrok | your server's permanent HTTPS address |
+| `RazorpayKeyId` / `RazorpayKeySecret` | `rzp_test_…` keys | `rzp_live_…` keys (Dashboard with **Test Mode off** → API Keys; needs an activated account) |
+| Razorpay webhook | added in Test Mode | added **again** in Live Mode (same `RazorpayWebhookUrl`), with its **own** secret |
+| `RazorpayWebhookSecret` | test webhook's secret | live webhook's secret |
+| Public address | the Lambda `FunctionUrl` | the same (nothing to change in Bitrix) |
 | Payments | `success@razorpay`, test cards | real money |
 
-Also before going live:
+Steps:
 
-- **Set `INBOUND_API_TOKEN`**, and add `&token=…` to the Bitrix automation rule URL.
-- Decide on **`MOVE_DEAL_TO_WON`**.
-- **Clear the test data** from the old test links:
-  - Deals still hold `plink_…` IDs from test mode. With live keys, Razorpay doesn't know those IDs; the service notices and ignores them. You can also clear the fields.
-  - Delete `data/processed_events.json` and `data/unresolved_links.json` when switching modes.
-- Run `npm run check-setup`. It should report `Razorpay mode: LIVE (real money!)`.
-- Make one small real payment end to end, and refund it from the Razorpay dashboard.
+1. Create the **live** API keys, then the **live** webhook, with a new secret and the same five events.
+2. Run `npm run build:lambda`, then `sam deploy --guided`, entering the live `RazorpayKeyId`, `RazorpayKeySecret` and `RazorpayWebhookSecret` ([changing a setting](#changing-a-setting-eg-new-razorpay-keys)). If `InboundApiToken` has ever been shared (e.g. in a screenshot), give a new one now too, and update the Bitrix rule's `token=`.
+3. Put the same live values in your local `.env`, then run `npm run check-setup`. It should say `Razorpay mode: LIVE (real money!)`.
+4. Decide on **`MoveDealToWon`**.
+5. **Test data:** deals still hold `plink_…` IDs from test mode. With live keys Razorpay doesn't know those IDs; the service notices and ignores them. You can also clear the fields. Old test records in DynamoDB don't need clearing: they don't clash with live ones and expire by themselves.
+6. Make one small real payment end to end (a ₹1 deal), then refund it from the Razorpay dashboard.
 
-## Running in production
+## Running on your own server instead
+
+The same code also runs as a normal, always-on Node.js server, if you ever move away from Lambda:
 
 ```bash
 npm ci
@@ -433,8 +576,8 @@ npm start
 
 - **Run it under a process manager** (pm2, systemd, a container restart policy, Windows Service…) so it restarts after a crash or reboot.
 - **HTTPS is required.** Razorpay only calls HTTPS webhook URLs. Put the service behind a reverse proxy (nginx, Caddy, a cloud load balancer) or a platform that provides HTTPS.
-- **Keep the `data/` folder** between deploys and restarts. It holds the duplicate-protection records and any unresolved links.
-- **Run a single instance.** The duplicate protection, the double-click lock and the unresolved-links record live in one process and its local files. To run several instances, move them into a shared database or Redis first.
+- **Keep the `data/` folder** between deploys and restarts. It holds the duplicate-protection records and any unresolved links. Alternatively, set `DYNAMODB_TABLE` to use DynamoDB here too.
+- **Run a single instance** when using the `data/` files: the duplicate protection, the double-click lock and the unresolved-links record then live in one process and its local files. With `DYNAMODB_TABLE` set, all three are in DynamoDB, so several instances can run side by side.
 - **Shutdown:** on stop (Ctrl+C / SIGTERM) the service stops accepting requests, finishes webhook work already in progress, saves its records, then exits. That takes at most 10 seconds.
 - **Monitoring:** point your uptime monitor at `GET /health`.
 
@@ -453,15 +596,22 @@ npm start
 - A real **failed payment** (Netbanking → Failure): Razorpay copies the link's notes onto the payment, so the deal is found directly (`found via payment.notes`), and the comment includes the bank's reason
 - A real **cancelled** webhook and its comment
 
+**Verified on AWS Lambda** (test mode):
+- The automation rule calling the Function URL, the link created and saved on the deal
+- A real payment (`success@razorpay`) arriving by webhook, and its comment
+- The token check, and the signature check with the webhook secret entered during the deploy
+- Duplicate protection with the **real DynamoDB table**: a signed test webhook sent twice was answered `accepted`, then `duplicate`
+
 **Not yet verified against the real Razorpay:**
-1. **Resend / duplicate protection.** Covered by automated tests, but not yet tried with Razorpay's **Resend** button.
+1. **Razorpay's Resend button.** Duplicate protection is verified (above, and by automated tests), but a resend from the Razorpay dashboard hasn't been tried.
 2. **Razorpay's wording for "this link ID doesn't exist"** was assumed. If it differs, that case stops with an error instead of going ahead: safe, but it would need a fix.
 
 **Limitations:**
 - **Two-decimal currencies only.** Amounts are multiplied by 100. That's right for INR and most currencies, but not for zero-decimal (JPY) or three-decimal (KWD, BHD) ones.
-- **Single instance only** (see [Running in production](#running-in-production)).
+- **Your own server with the `data/` files: single instance only** (see [Running on your own server instead](#running-on-your-own-server-instead)). Lambda uses DynamoDB and has no such limit.
 - **Only the link in the deal's field is cancelled** when a new link is created. Links that were replaced before this feature existed must be cancelled by hand in the dashboard.
-- **Webhook processing isn't retried.** Razorpay gets its 200 straight away, so if Bitrix is down at that moment the comment is lost, and the failure is only in the log.
+- **Failed Bitrix work isn't retried later.** If Bitrix is down when a webhook arrives, the service still answers 200, since resending wouldn't help if Bitrix stays down. The comment is then lost, and the failure is only in the log.
+- **On Lambda, the webhook comment is posted before the answer.** If Bitrix takes longer than Razorpay is willing to wait, Razorpay records a failed delivery and resends. The resend is recognised as a duplicate, so no double comment.
 
 ## Troubleshooting
 
@@ -479,27 +629,48 @@ npm start
 | Comment "… could not be saved to the deal, so it was cancelled" | Usually a required deal field is empty (e.g. *Purpose*). Fill it in and retry. |
 | Changed `.env` but nothing changed | Restart `npm run dev`; it doesn't reload `.env`. |
 | Every test file fails with `Vitest failed to find the runner` | You ran `npx vitest` from a terminal whose path starts with a lowercase `c:\` (a vitest bug on Windows). Use `npm test`, which corrects the drive letter first. |
+| **AWS:** moving a deal to *Payment Link* does nothing, and the logs show **no** `POST /payment-links` | Bitrix never reached the service. The rule's Handler still has an old address, **contains a line break** (copied from a wrapped terminal line; use the [clipboard step](#creating-links-automatically-from-a-deal-stage)), or wasn't saved (there are two Save buttons). Then move the deal out of the stage and back in. |
+| **AWS:** logs show `POST /payment-links -> 400` | The address arrived, but the deal ID didn't. Re-insert it with **•••** → **Deal → ID** instead of typing `{{ID}}`. |
+| **AWS:** logs show `-> 401` | The `token=` in the rule's URL doesn't match the `InboundApiToken` given at deploy time. |
+| `'aws'` / `'sam'` is not recognized | Close VS Code or the terminal app completely and reopen it after installing. |
+| `sam deploy --guided` seems frozen at a secret question | It isn't: secret answers are invisible while you type or paste. Paste once and press Enter. |
+| Deploy fails with `AccessDenied` / `not authorized to perform` | The deploy user is missing one of the six policies in [One-time setup](#one-time-setup). |
+| Deploy fails: parameter "failed to satisfy constraint" | A value doesn't have the expected form: e.g. the token is shorter than 16 characters, a field name doesn't start with `UF_CRM_`, or the key ID doesn't start with `rzp_test_`/`rzp_live_`. |
+| Lambda logs: `DYNAMODB_TABLE is not set` | The function was deployed without the template. Deploy with `sam deploy`, which sets it automatically. |
+| The Function URL answers `403 Forbidden` / `AccessDeniedException` | The URL's public-access permission is missing. It's normally created by the template; redeploy, and report it if it persists. |
 | Service refuses to start: `Could not read data/unresolved_links.json` | The file is damaged. Check the Razorpay dashboard for any link it might list, cancel it if needed, then delete the file. |
 
-The service logs one line per request (`[http] …`) and one per important step (`[payment-links] …`, `[webhook] …`). Secrets and the `?token=` value are never logged.
+The service logs one line per request (`[http] …`) and one per important step (`[payment-links] …`, `[webhook] …`). Secrets and the `?token=` value are never logged. On Lambda the logs are in CloudWatch ([Checking it works](#checking-it-works)).
 
 ## Project structure
 
 ```
 src/
-  main.ts            entry point: loads config, starts the server, graceful shutdown
+  lambda.ts          entry point on AWS Lambda: wraps the Express app, Lambda-only settings
+  main.ts            entry point on your computer / own server: starts the server, graceful shutdown
   app.ts             Express routes only
   config.ts          settings from environment variables, validated with zod
   bitrix.ts          Bitrix24 REST calls and error handling
   razorpay.ts        Razorpay API calls, paise conversion, error handling
-  paymentLinks.ts    flow 1: create a link for a deal
-  webhookHandler.ts  flow 2: signature, duplicates, finding the deal, comment text
+  paymentLinks.ts    flow 1: create a link for a deal (+ the file-based unresolved-links store)
+  webhookHandler.ts  flow 2: signature, duplicates, finding the deal, comment text (+ the file-based event store)
+  storage.ts         the three things the service remembers, as contracts (+ the in-memory deal lock)
+  dynamoStorage.ts   the DynamoDB versions of those contracts, used on Lambda
+  createStorage.ts   picks files or DynamoDB (DYNAMODB_TABLE)
   models.ts          request/response shapes and webhook schemas (zod)
 scripts/
   listFields.ts      npm run list-fields
   checkSetup.ts      npm run check-setup
   sendTestWebhook.ts npm run send-webhook
-tests/               automated tests (vitest) against fake Bitrix24 and Razorpay servers
-data/                created at runtime; keep it between restarts (git-ignored)
+  buildLambda.mjs    npm run build:lambda
+  test.mjs           npm test (fixes the Windows drive-letter issue, then runs vitest)
+tests/               automated tests (vitest) against fake Bitrix24, Razorpay and DynamoDB
+template.yaml        what AWS creates: function, URL, table, logs, permission (SAM)
 .env.example         every setting, with placeholder values
+
+Created on your computer, git-ignored:
+.env                 your settings and secrets
+data/                the local service's records; keep it between restarts
+dist-lambda/         the built Lambda code (npm run build:lambda)
+samconfig.toml       your sam deploy answers, including secrets
 ```
