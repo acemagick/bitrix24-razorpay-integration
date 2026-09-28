@@ -16,8 +16,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { onTestFinished } from "vitest";
 
+import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+
 import { BitrixClient } from "../src/bitrix.ts";
 import { loadConfig, type Config } from "../src/config.ts";
+import { CONDITIONS, type DocumentClient } from "../src/dynamoStorage.ts";
 import { RazorpayClient } from "../src/razorpay.ts";
 
 // --------------------------------------------------------------------------- basics
@@ -330,3 +333,72 @@ export function paymentEntity(fields: Record<string, unknown> = {}): Record<stri
     ...fields,
   };
 }
+
+// --------------------------------------------------------------------------- fake DynamoDB
+
+type Item = Record<string, unknown>;
+
+/**
+ * An in-memory stand-in for a DynamoDB table.
+ *
+ * Like the real service it:
+ *   - applies a write only if its ConditionExpression holds, otherwise throws
+ *     ConditionalCheckFailedException;
+ *   - rejects a request whose #names / :values don't match its expression
+ *     exactly (missing OR unused ones), which the real service also refuses.
+ * It only understands the four conditions dynamoStorage.ts uses.
+ */
+export class FakeDynamo implements DocumentClient {
+  readonly items = new Map<string, Item>();
+  failWith: Error | undefined;
+
+  async send(command: PutCommand | GetCommand | DeleteCommand): Promise<unknown> {
+    if (this.failWith) throw this.failWith;
+    const input = command.input as {
+      Item?: Item;
+      Key?: Item;
+      ConditionExpression?: string;
+      ExpressionAttributeNames?: Record<string, string>;
+      ExpressionAttributeValues?: Record<string, unknown>;
+    };
+    const pk = String((input.Item ?? input.Key)?.pk);
+    const existing = this.items.get(pk);
+
+    if (input.ConditionExpression) {
+      checkPlaceholders(input.ConditionExpression, input.ExpressionAttributeNames, input.ExpressionAttributeValues);
+      if (!conditionHolds(input.ConditionExpression, existing, input.ExpressionAttributeValues ?? {})) {
+        throw Object.assign(new Error("The conditional request failed"), { name: "ConditionalCheckFailedException" });
+      }
+    }
+
+    if (command instanceof PutCommand) this.items.set(pk, { ...input.Item });
+    else if (command instanceof DeleteCommand) this.items.delete(pk);
+    else if (command instanceof GetCommand) return { Item: existing && { ...existing } };
+    return {};
+  }
+}
+
+function checkPlaceholders(expression: string, names: Record<string, string> = {}, values: Record<string, unknown> = {}) {
+  const usedNames = new Set(expression.match(/#\w+/g) ?? []);
+  const usedValues = new Set(expression.match(/:\w+/g) ?? []);
+  const sameSet = (used: Set<string>, given: string[]) => used.size === given.length && given.every((g) => used.has(g));
+  if (!sameSet(usedNames, Object.keys(names)) || !sameSet(usedValues, Object.keys(values))) {
+    throw Object.assign(new Error(`Placeholders don't match the expression: ${expression}`), { name: "ValidationException" });
+  }
+}
+
+function conditionHolds(expression: string, item: Item | undefined, v: Record<string, unknown>): boolean {
+  switch (expression) {
+    case CONDITIONS.claimEvent:
+      return !item || (item.state === v[":processing"] && Number(item.lockUntil) < Number(v[":now"]));
+    case CONDITIONS.releaseEvent:
+      return !!item && item.state === v[":processing"];
+    case CONDITIONS.acquireLock:
+      return !item || Number(item.lockUntil) < Number(v[":now"]);
+    case CONDITIONS.releaseLock:
+      return !!item && item.owner === v[":owner"];
+    default:
+      throw new Error(`The fake doesn't know this condition: ${expression}`);
+  }
+}
+
