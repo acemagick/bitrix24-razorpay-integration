@@ -33,6 +33,15 @@ describe("BitrixClient.call", () => {
     expect(requests).toEqual([{ url: "https://portal.bitrix24.test/rest/1/secret/crm.deal.get.json", body: '{"id":7}' }]);
   });
 
+  it("callPage() also returns `next`, and undefined on the last page", async () => {
+    const { client } = clientAnswering(
+      () => json(200, { result: { categories: [{ id: 0 }] }, next: 50, total: 51 }),
+      () => json(200, { result: { categories: [{ id: 9 }] }, total: 51 }),
+    );
+    expect(await client.callPage("crm.category.list", { start: 0 })).toEqual({ result: { categories: [{ id: 0 }] }, next: 50 });
+    expect(await client.callPage("crm.category.list", { start: 50 })).toEqual({ result: { categories: [{ id: 9 }] }, next: undefined });
+  });
+
   it("treats HTTP 200 with an `error` key as a failure", async () => {
     const { client } = clientAnswering(() => json(200, { error: "ACCESS_DENIED", error_description: "Access denied" }));
     await expect(client.call("crm.deal.get")).rejects.toMatchObject({

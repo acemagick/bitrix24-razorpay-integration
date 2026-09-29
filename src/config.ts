@@ -117,6 +117,15 @@ const envSchema = z.object({
   // disk and may run several copies at once. Leave empty on a normal server.
   DYNAMODB_TABLE: z.string().trim().min(1).optional(),
 
+  // The ID of the "Recurring" pipeline (yearly subscription renewals). Deals in
+  // it get the yearly renewal links from POST /recurring/payment-links. Leave
+  // empty to switch that address off. Find the ID with: npm run list-pipelines
+  RECURRING_CATEGORY_ID: z
+    .string()
+    .trim()
+    .regex(/^\d+$/, "RECURRING_CATEGORY_ID must be a pipeline ID number (see npm run list-pipelines)")
+    .optional(),
+
   // HTTP port for the Express server.
   PORT: z.coerce.number().int().min(1).max(65535).default(8000),
 });
@@ -138,6 +147,8 @@ export interface Config {
   processedEventsPath: string;
   unresolvedLinksPath: string;
   dynamodbTable: string | undefined;
+  /** The Recurring pipeline's ID; undefined = recurring renewal links switched off. */
+  recurringCategoryId: string | undefined;
   port: number;
 }
 
@@ -174,6 +185,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     processedEventsPath: e.PROCESSED_EVENTS_PATH,
     unresolvedLinksPath: e.UNRESOLVED_LINKS_PATH,
     dynamodbTable: e.DYNAMODB_TABLE,
+    recurringCategoryId: e.RECURRING_CATEGORY_ID,
     port: e.PORT,
   };
 }

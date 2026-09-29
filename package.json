@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node scripts/test.mjs",
     "list-fields": "tsx scripts/listFields.ts",
+    "list-pipelines": "tsx scripts/listPipelines.ts",
     "check-setup": "tsx scripts/checkSetup.ts",
     "send-webhook": "tsx scripts/sendTestWebhook.ts"
   },

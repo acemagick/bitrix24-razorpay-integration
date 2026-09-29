@@ -146,6 +146,21 @@ export class BitrixClient {
    * so retrying could post the same comment twice.
    */
   async call<T = unknown>(method: string, params: BitrixRecord = {}): Promise<T> {
+    return (await this.send(method, params)).result as T;
+  }
+
+  /**
+   * Like call(), for list methods, which return at most 50 items per call.
+   * Also returns `next`: the `start` value that fetches the following page, or
+   * undefined when this was the last page.
+   */
+  async callPage<T = unknown>(method: string, params: BitrixRecord = {}): Promise<{ result: T; next: number | undefined }> {
+    const body = await this.send(method, params);
+    return { result: body.result as T, next: typeof body.next === "number" ? body.next : undefined };
+  }
+
+  /** The request behind call() and callPage(): returns the whole response body. */
+  private async send(method: string, params: BitrixRecord): Promise<BitrixRecord> {
     const url = `${this.webhookUrl}${method}.json`;
     const attempts = 2;
 
@@ -202,7 +217,7 @@ export class BitrixClient {
         throw new BitrixApiError(method, `HTTP_${response.status}`, `Unexpected response: ${text.slice(0, 200)}`);
       }
 
-      return body.result as T;
+      return body;
     }
 
     // Unreachable (the loop always returns or throws); keeps TypeScript happy.

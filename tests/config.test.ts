@@ -56,6 +56,16 @@ describe("loadConfig", () => {
   it("rejects a field label pasted instead of a UF_CRM_ API name", () => {
     expect(() => loadConfig({ ...required, BITRIX_PAYMENT_ID_FIELD: "Razorpay Link ID" })).toThrow(/UF_CRM_/);
   });
+
+  it("reads the Recurring pipeline's ID, and leaves recurring links off when it's empty", () => {
+    expect(loadConfig({ ...required, RECURRING_CATEGORY_ID: "3" }).recurringCategoryId).toBe("3");
+    expect(loadConfig({ ...required, RECURRING_CATEGORY_ID: "" }).recurringCategoryId).toBeUndefined();
+    expect(loadConfig(required).recurringCategoryId).toBeUndefined();
+  });
+
+  it("rejects a pipeline name typed instead of its ID", () => {
+    expect(() => loadConfig({ ...required, RECURRING_CATEGORY_ID: "Recurring" })).toThrow(/npm run list-pipelines/);
+  });
 });
 
 describe("Secret", () => {
