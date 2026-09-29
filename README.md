@@ -693,6 +693,13 @@ npm start
 - A real payment (`success@razorpay`) arriving by webhook, and its comment
 - The token check, and the signature check with the webhook secret entered during the deploy
 - Duplicate protection with the **real DynamoDB table**: a signed test webhook sent twice was answered `accepted`, then `duplicate`
+- **Recurring pipeline**, on a test deal:
+  - *1 month* created this year's link (`<id>-2026`);
+  - *15 days* reused the **same** link;
+  - payment with `success@razorpay` moved the deal back to *Active*;
+  - *5 days* reported "already paid".
+
+  The "next year" cases (a new link after 12 months, cancelling last year's unpaid link) are covered by automated tests with a moved clock, since they can't be tried live without waiting a year.
 
 **Not yet verified against the real Razorpay:**
 1. **Razorpay's Resend button.** Duplicate protection is verified (above, and by automated tests), but a resend from the Razorpay dashboard hasn't been tried.
