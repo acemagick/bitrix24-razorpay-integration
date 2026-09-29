@@ -80,11 +80,24 @@ export interface CreatePaymentLinkInput {
   amount: Big;
   currency: string;
   description: string;
-  /** Bitrix deal ID. Used as the reference_id and stored in notes. */
+  /** Bitrix deal ID. Stored in notes, and the default reference_id. */
   dealId: string;
   customer?: Customer | undefined;
   acceptPartial?: boolean;
+  /** Days until the link expires. Leave out for a link that never expires. */
   expireInDays?: number | undefined;
+  /**
+   * What the reference_id (the customer's "RECEIPT" number) starts from:
+   * "<base>", then "<base>-2", "<base>-3"... while those are taken. Defaults to
+   * the deal ID (the Deals pipeline). Recurring links use "<dealId>-<year>".
+   */
+  referenceBase?: string;
+  /**
+   * Extra labels stored in the link's notes (e.g. which subscription year it's
+   * for). They come back in every webhook. bitrix_deal_id can't be overridden:
+   * payments are matched to deals by it.
+   */
+  extraNotes?: Record<string, string>;
 }
 
 /** The fields we use from Razorpay's payment link object (it has many more). */
@@ -99,6 +112,8 @@ export interface PaymentLink {
   /** The order behind the link; payments on the link belong to it. */
   order_id?: string | null;
   notes: Record<string, string> | [] | null;
+  /** When Razorpay created the link, in Unix seconds. */
+  created_at?: number;
 }
 
 /** The fields we use from a Razorpay order (fallback lookup for payment.failed). */
@@ -202,8 +217,9 @@ export class RazorpayClient {
    * auth failure, network) is thrown straight away.
    */
   async createPaymentLinkForDeal(input: CreatePaymentLinkInput): Promise<PaymentLink> {
+    const base = input.referenceBase ?? input.dealId;
     for (let attempt = 1; attempt <= RazorpayClient.MAX_REFERENCE_ATTEMPTS; attempt++) {
-      const referenceId = attempt === 1 ? input.dealId : `${input.dealId}-${attempt}`;
+      const referenceId = attempt === 1 ? base : `${base}-${attempt}`;
       try {
         return await this.createPaymentLink(input, referenceId);
       } catch (err) {
@@ -214,7 +230,7 @@ export class RazorpayClient {
     throw new RazorpayApiError(
       400,
       "TOO_MANY_LINKS",
-      `Deal ${input.dealId} already has ${RazorpayClient.MAX_REFERENCE_ATTEMPTS} payment links. ` +
+      `Deal ${input.dealId} already has ${RazorpayClient.MAX_REFERENCE_ATTEMPTS} payment links with reference ${base}. ` +
         "Cancel old links in the Razorpay dashboard, or raise MAX_REFERENCE_ATTEMPTS.",
     );
   }
@@ -276,7 +292,8 @@ export function buildPaymentLinkPayload(input: CreatePaymentLinkInput, reference
     // webhook for this link. The webhook handler uses the deal ID here to find
     // the deal, then checks the deal's saved Link ID really is this link before
     // acting, so notes copied onto another link or payment don't count.
-    notes: { bitrix_deal_id: input.dealId },
+    // Extra notes first, so bitrix_deal_id always wins.
+    notes: { ...input.extraNotes, bitrix_deal_id: input.dealId },
     accept_partial: input.acceptPartial ?? false,
   };
 

@@ -86,6 +86,20 @@ describe("buildPaymentLinkPayload", () => {
     expect(payload.expire_by).toBeGreaterThanOrEqual(before + 7 * 86_400);
     expect(payload.expire_by).toBeLessThan(before + 7 * 86_400 + 5);
   });
+
+  it("makes a link that never expires when no expiry is given (recurring links)", () => {
+    expect(buildPaymentLinkPayload(input(), "66-2026")).not.toHaveProperty("expire_by");
+  });
+
+  it("adds extra notes next to the deal ID", () => {
+    const payload = buildPaymentLinkPayload(input({ extraNotes: { subscription_year: "2026" } }), "54-2026");
+    expect(payload.notes).toEqual({ subscription_year: "2026", bitrix_deal_id: "54" });
+  });
+
+  it("never lets extra notes replace the deal ID (payments are matched by it)", () => {
+    const payload = buildPaymentLinkPayload(input({ extraNotes: { bitrix_deal_id: "999" } }), "54");
+    expect(payload.notes).toEqual({ bitrix_deal_id: "54" });
+  });
 });
 
 describe("RazorpayClient errors", () => {
@@ -167,5 +181,27 @@ describe("createPaymentLinkForDeal", () => {
     );
     await expect(rzp.client.createPaymentLinkForDeal(input())).rejects.toMatchObject({ field: "amount" });
     expect(rzp.calls).toEqual(["POST /payment_links"]);
+  });
+
+  it("starts from referenceBase when given (recurring: <dealId>-<year>), with the same -2 suffix retry", async () => {
+    const rzp = createFakeRazorpay();
+    rzp.addLink({ id: "plink_A", reference_id: "66-2026" }); // e.g. a link someone made by hand
+
+    const link = await rzp.client.createPaymentLinkForDeal(
+      input({ dealId: "66", referenceBase: "66-2026", extraNotes: { subscription_year: "2026" } }),
+    );
+
+    expect(link.reference_id).toBe("66-2026-2");
+    expect(link.notes).toEqual({ subscription_year: "2026", bitrix_deal_id: "66" });
+  });
+
+  it("still uses the plain deal ID when no referenceBase is given (Deals pipeline unchanged)", async () => {
+    const rzp = createFakeRazorpay();
+    const link = await rzp.client.createPaymentLinkForDeal(input());
+    expect(link.reference_id).toBe("54");
+    // The exact request body the Deals pipeline has always sent.
+    expect(rzp.created()[0]?.request).toEqual(buildPaymentLinkPayload(input(), "54"));
+    expect(rzp.created()[0]?.request).toMatchObject({ notes: { bitrix_deal_id: "54" }, reference_id: "54" });
+    expect(link.notes).toEqual({ bitrix_deal_id: "54" });
   });
 });
