@@ -126,8 +126,30 @@ const envSchema = z.object({
     .regex(/^\d+$/, "RECURRING_CATEGORY_ID must be a pipeline ID number (see npm run list-pipelines)")
     .optional(),
 
+  // The Recurring pipeline's "Active" stage (waiting for next year's reminders).
+  // After a renewal is paid, the deal is moved back there. Defaults to the
+  // pipeline's first stage, "C<pipeline id>:NEW"; Bitrix keeps that ID even if
+  // the stage is renamed. The stage IDs are printed by: npm run list-pipelines
+  RECURRING_ACTIVE_STAGE_ID: z
+    .string()
+    .trim()
+    .regex(/^C\d+:\w+$/, "RECURRING_ACTIVE_STAGE_ID must be a stage ID like C6:NEW (see npm run list-pipelines)")
+    .optional(),
+
   // HTTP port for the Express server.
   PORT: z.coerce.number().int().min(1).max(65535).default(8000),
+}).superRefine((env, ctx) => {
+  // A stage from another pipeline (e.g. C7:NEW with pipeline 6) would move paid
+  // Recurring deals out of their pipeline, so the stage must be the pipeline's own.
+  const category = env.RECURRING_CATEGORY_ID;
+  const stage = env.RECURRING_ACTIVE_STAGE_ID;
+  if (category && stage && !stage.startsWith(`C${category}:`)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["RECURRING_ACTIVE_STAGE_ID"],
+      message: `RECURRING_ACTIVE_STAGE_ID must be a stage of pipeline ${category} (C${category}:...), but ${stage} belongs to another pipeline (see npm run list-pipelines)`,
+    });
+  }
 });
 
 // --------------------------------------------------------------------------- Config
@@ -149,6 +171,8 @@ export interface Config {
   dynamodbTable: string | undefined;
   /** The Recurring pipeline's ID; undefined = recurring renewal links switched off. */
   recurringCategoryId: string | undefined;
+  /** The stage a Recurring deal goes back to after a renewal is paid, e.g. "C6:NEW". */
+  recurringActiveStageId: string | undefined;
   port: number;
 }
 
@@ -186,6 +210,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     unresolvedLinksPath: e.UNRESOLVED_LINKS_PATH,
     dynamodbTable: e.DYNAMODB_TABLE,
     recurringCategoryId: e.RECURRING_CATEGORY_ID,
+    recurringActiveStageId:
+      e.RECURRING_ACTIVE_STAGE_ID ?? (e.RECURRING_CATEGORY_ID ? `C${e.RECURRING_CATEGORY_ID}:NEW` : undefined),
     port: e.PORT,
   };
 }

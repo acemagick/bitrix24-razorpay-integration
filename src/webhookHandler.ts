@@ -460,14 +460,19 @@ export function buildComment(webhook: RazorpayWebhook): string | undefined {
 export interface WebhookDeps extends DealLookupDeps {
   // Pick<> lists exactly the methods we use, so tests can pass a small fake
   // object instead of a real client.
-  bitrix: Pick<BitrixClient, "safeComment" | "getDeal" | "moveDealToWon">;
+  bitrix: Pick<BitrixClient, "safeComment" | "getDeal" | "moveDealToWon" | "updateDeal">;
+  /** Deals pipeline: move the deal to Won when its link is paid (MOVE_DEAL_TO_WON). */
   moveDealToWon: boolean;
+  /** The Recurring pipeline's ID; its deals go back to Active when paid, never to Won. */
+  recurringCategoryId?: string | undefined;
+  /** The Recurring pipeline's Active stage, e.g. "C6:NEW". */
+  recurringActiveStageId?: string | undefined;
 }
 
 export type ProcessOutcome =
   | { status: "ignored"; reason: string }
   | { status: "no_deal" }
-  | { status: "done"; dealId: string; commented: boolean; movedToWon?: boolean };
+  | { status: "done"; dealId: string; commented: boolean; movedToWon?: boolean; movedToActive?: boolean };
 
 /**
  * Act on one verified, de-duplicated webhook.
@@ -496,27 +501,50 @@ export async function processWebhook(webhook: RazorpayWebhook, deps: WebhookDeps
     // safeComment logs its own failures (e.g. Bitrix down, or the deal was deleted).
     const commented = comment ? await deps.bitrix.safeComment(dealId, comment) : false;
 
-    if (webhook.event !== "payment_link.paid" || !deps.moveDealToWon) {
+    // After a full payment the deal may move to another stage:
+    //   Recurring pipeline -> back to Active, to wait for next year's reminders
+    //                         (never Won: the subscription goes on)
+    //   Deals pipeline     -> Won, if MOVE_DEAL_TO_WON is on
+    const recurringOn = Boolean(deps.recurringCategoryId && deps.recurringActiveStageId);
+    if (webhook.event !== "payment_link.paid" || (!deps.moveDealToWon && !recurringOn)) {
       return { status: "done", dealId, commented };
     }
 
-    // Optional: move the deal to Won. We fetch the deal to learn its pipeline,
-    // because the Won stage ID differs per pipeline ("WON" vs "C3:WON").
+    // We fetch the deal to learn its pipeline: that decides where it goes, and
+    // stage IDs differ per pipeline ("WON" vs "C3:WON").
+    let target = "its next stage"; // until we know the pipeline
     try {
       const deal = await deps.bitrix.getDeal(dealId);
-      await deps.bitrix.moveDealToWon(dealId, String(deal.CATEGORY_ID ?? "0"));
+      const categoryId = String(deal.CATEGORY_ID ?? "0");
+
+      if (recurringOn && categoryId === deps.recurringCategoryId) {
+        target = "Active";
+        await deps.bitrix.updateDeal(dealId, { STAGE_ID: deps.recurringActiveStageId });
+        console.info(`[webhook] Recurring deal ${dealId} moved back to Active (${deps.recurringActiveStageId})`);
+        await deps.bitrix.safeComment(dealId, "Renewal paid: the deal is back in Active until next year's reminders.");
+        return { status: "done", dealId, commented, movedToActive: true };
+      }
+      if (!deps.moveDealToWon) return { status: "done", dealId, commented };
+
+      target = "Won";
+      await deps.bitrix.moveDealToWon(dealId, categoryId);
       console.info(`[webhook] Deal ${dealId} moved to Won`);
       return { status: "done", dealId, commented, movedToWon: true };
     } catch (err) {
       // The payment itself succeeded, so this is a warning for the sales
       // team, not a payment problem.
-      console.error(`[webhook] Deal ${dealId}: could not move to Won`, err);
+      console.error(`[webhook] Deal ${dealId}: could not move to ${target}`, err);
       await deps.bitrix.safeComment(
         dealId,
-        `Payment received, but the deal could not be moved to Won automatically: ${(err as Error).message}\n` +
+        `Payment received, but the deal could not be moved to ${target} automatically: ${(err as Error).message}\n` +
           "Please move it manually.",
       );
-      return { status: "done", dealId, commented, movedToWon: false };
+      return {
+        status: "done",
+        dealId,
+        commented,
+        ...(target === "Active" ? { movedToActive: false } : target === "Won" ? { movedToWon: false } : {}),
+      };
     }
   } catch (err) {
     // A bug in our own code. Log everything; there's no deal we can safely blame.

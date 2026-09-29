@@ -402,3 +402,65 @@ describe("processWebhook", () => {
     await expect(processWebhook(paid(), deps)).resolves.toEqual({ status: "done", dealId: "42", commented: false });
   });
 });
+
+// --------------------------------------------------------------------------- Recurring pipeline
+
+describe("processWebhook for the Recurring pipeline", () => {
+  const paid = () =>
+    parse(webhookBody("payment_link.paid", { payment_link: linkEntity({ amount_paid: 149_999 }), payment: paymentEntity() }));
+
+  /** Deal 42 in the Recurring pipeline (ID 6), with recurring switched on. */
+  function recurringSetup() {
+    const setup = webhookSetup();
+    setup.bitrix.deals.set("42", deal({ ID: "42", CATEGORY_ID: "6", STAGE_ID: "C6:EXECUTING", UF_CRM_LINK_ID: "plink_ABC" }));
+    const deps = { ...setup.deps, recurringCategoryId: "6", recurringActiveStageId: "C6:NEW" };
+    return { ...setup, deps };
+  }
+
+  it("moves a paid Recurring deal back to Active, with a comment", async () => {
+    const { bitrix, deps } = recurringSetup();
+    const outcome = await processWebhook(paid(), deps);
+    expect(outcome).toMatchObject({ status: "done", commented: true, movedToActive: true });
+    expect(bitrix.deals.get("42")?.STAGE_ID).toBe("C6:NEW");
+    expect(bitrix.comments("42").at(-1)).toContain("back in Active until next year");
+  });
+
+  it("never moves a Recurring deal to Won, even with MOVE_DEAL_TO_WON on", async () => {
+    const { bitrix, deps } = recurringSetup();
+    await processWebhook(paid(), { ...deps, moveDealToWon: true });
+    expect(bitrix.deals.get("42")?.STAGE_ID).toBe("C6:NEW");
+  });
+
+  it("still moves a Deals-pipeline deal to Won as before", async () => {
+    const { bitrix, deps } = recurringSetup();
+    bitrix.deals.set("42", deal({ ID: "42", CATEGORY_ID: "0", UF_CRM_LINK_ID: "plink_ABC" }));
+    const outcome = await processWebhook(paid(), { ...deps, moveDealToWon: true });
+    expect(outcome).toMatchObject({ movedToWon: true });
+    expect(bitrix.deals.get("42")?.STAGE_ID).toBe("WON");
+  });
+
+  it("leaves a Deals-pipeline deal alone when MOVE_DEAL_TO_WON is off", async () => {
+    const { bitrix, deps } = recurringSetup();
+    bitrix.deals.set("42", deal({ ID: "42", CATEGORY_ID: "0", STAGE_ID: "FINAL_INVOICE", UF_CRM_LINK_ID: "plink_ABC" }));
+    expect(await processWebhook(paid(), deps)).toEqual({ status: "done", dealId: "42", commented: true });
+    expect(bitrix.deals.get("42")?.STAGE_ID).toBe("FINAL_INVOICE");
+  });
+
+  it("asks for a manual move when the move to Active is refused", async () => {
+    const { bitrix, deps } = recurringSetup();
+    bitrix.failOn("crm.deal.update", () => json(200, { error: "ACCESS_DENIED", error_description: "Access denied" }));
+    const outcome = await processWebhook(paid(), deps);
+    expect(outcome).toMatchObject({ commented: true, movedToActive: false });
+    expect(bitrix.comments("42").at(-1)).toMatch(/could not be moved to Active automatically: .*ACCESS_DENIED[\s\S]*manually/);
+  });
+
+  it("only moves on a full payment (not partial, failed, cancelled...)", async () => {
+    const { bitrix, deps } = recurringSetup();
+    const partial = parse(
+      webhookBody("payment_link.partially_paid", { payment_link: linkEntity({ amount_paid: 50_000 }), payment: paymentEntity({ amount: 50_000 }) }),
+    );
+    await processWebhook(partial, deps);
+    expect(bitrix.callsTo("crm.deal.update")).toHaveLength(0);
+  });
+});
+

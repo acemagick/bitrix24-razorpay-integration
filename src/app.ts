@@ -29,6 +29,7 @@ import {
 } from "./models.ts";
 import { FlowError, createPaymentLinkForDeal } from "./paymentLinks.ts";
 import type { RazorpayClient } from "./razorpay.ts";
+import { isRenewalReminder, sendRenewalReminder } from "./recurringLinks.ts";
 import type { DealLock, EventStore, UnresolvedLinkRecords } from "./storage.ts";
 import { dedupeKey, processWebhook, verifySignature } from "./webhookHandler.ts";
 
@@ -117,6 +118,43 @@ export function createApp(deps: AppDeps): CreatedApp {
     }
   });
 
+  // ------------------------------------------------------------------ POST /recurring/payment-links
+  // The Recurring pipeline's renewal reminders (see recurringLinks.ts). Each of
+  // its three reminder stages calls this with days=30, 15 or 5:
+  //   /recurring/payment-links?deal_id={{ID}}&days=30&token=...
+  // Kept apart from /payment-links: the Deals pipeline's rules are different.
+  app.post("/recurring/payment-links", ...parseJsonOrForm, requireToken(config), async (req, res) => {
+    if (!config.recurringCategoryId) {
+      return sendError(res, 404, "NOT_FOUND", "Renewal links are switched off (RECURRING_CATEGORY_ID is not set).");
+    }
+
+    let dealId: string;
+    try {
+      dealId = extractDealId(req.query, req.body);
+    } catch (err) {
+      if (err instanceof RequestValidationError) return sendError(res, 400, "BAD_REQUEST", err.message);
+      throw err;
+    }
+
+    const rawDays = req.query.days ?? (req.body as Record<string, unknown> | undefined)?.days;
+    const days = Number(rawDays);
+    if (!isRenewalReminder(days)) {
+      return sendError(res, 400, "BAD_REQUEST", "days must be 30, 15 or 5 (the reminder: 1 month, 15 days or 5 days left).", dealId);
+    }
+
+    try {
+      const result = await sendRenewalReminder(dealId, days, { config, bitrix, razorpay, unresolvedLinks, dealLock });
+      // 201 when a new link was created; 200 when an existing one was reused or already paid.
+      res.status(result.status === "created" ? 201 : 200).json(result);
+    } catch (err) {
+      if (err instanceof FlowError) {
+        // Already commented on the deal by the flow. Just answer the caller.
+        return sendError(res, err.httpStatus, err.code, err.message, err.dealId);
+      }
+      throw err; // unexpected: handled by the error middleware below
+    }
+  });
+
   // ------------------------------------------------------------------ POST /webhooks/razorpay
   // express.raw() gives us req.body as a Buffer of the exact bytes received.
   // `type: "*/*"` accepts any Content-Type, so a missing or odd header can't make
@@ -196,6 +234,8 @@ export function createApp(deps: AppDeps): CreatedApp {
       linkIdField: config.bitrixPaymentIdField,
       unresolvedLinks,
       moveDealToWon: config.moveDealToWon,
+      recurringCategoryId: config.recurringCategoryId,
+      recurringActiveStageId: config.recurringActiveStageId,
     });
     const failed = (err: unknown) => {
       console.error("[webhook] processWebhook threw unexpectedly", err);

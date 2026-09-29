@@ -63,6 +63,23 @@ describe("loadConfig", () => {
     expect(loadConfig(required).recurringCategoryId).toBeUndefined();
   });
 
+  it("works out the Recurring pipeline's Active stage (C<id>:NEW) unless one is given", () => {
+    expect(loadConfig({ ...required, RECURRING_CATEGORY_ID: "6" }).recurringActiveStageId).toBe("C6:NEW");
+    expect(
+      loadConfig({ ...required, RECURRING_CATEGORY_ID: "6", RECURRING_ACTIVE_STAGE_ID: "C6:PREPARATION" }).recurringActiveStageId,
+    ).toBe("C6:PREPARATION");
+    expect(loadConfig(required).recurringActiveStageId).toBeUndefined();
+    expect(() => loadConfig({ ...required, RECURRING_ACTIVE_STAGE_ID: "Active" })).toThrow(/C6:NEW/);
+  });
+
+  it("rejects an Active stage from a different pipeline than the Recurring one", () => {
+    expect(() => loadConfig({ ...required, RECURRING_CATEGORY_ID: "6", RECURRING_ACTIVE_STAGE_ID: "C7:NEW" })).toThrow(
+      /RECURRING_ACTIVE_STAGE_ID: .*stage of pipeline 6/,
+    );
+    // Only the whole ID counts: pipeline 6's stages don't start "C66:".
+    expect(() => loadConfig({ ...required, RECURRING_CATEGORY_ID: "6", RECURRING_ACTIVE_STAGE_ID: "C66:NEW" })).toThrow();
+  });
+
   it("rejects a pipeline name typed instead of its ID", () => {
     expect(() => loadConfig({ ...required, RECURRING_CATEGORY_ID: "Recurring" })).toThrow(/npm run list-pipelines/);
   });

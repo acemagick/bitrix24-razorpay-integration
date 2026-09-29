@@ -163,6 +163,85 @@ describe("POST /payment-links", () => {
   });
 });
 
+// --------------------------------------------------------------------------- Recurring pipeline
+
+describe("POST /recurring/payment-links", () => {
+  /** The app with the Recurring pipeline (ID 6) switched on, and deal 66 in it. */
+  async function startRecurring(env: Record<string, string> = {}) {
+    const started = await startApp({ RECURRING_CATEGORY_ID: "6", ...env });
+    started.bitrix.deals.set("66", deal({ ID: "66", TITLE: "Annual plan", CATEGORY_ID: "6", OPPORTUNITY: "999" }));
+    return started;
+  }
+  const post = (base: string, query: string, init: RequestInit = {}) =>
+    fetch(`${base}/recurring/payment-links${query}`, { method: "POST", ...init });
+
+  it("is off (404) when RECURRING_CATEGORY_ID isn't set", async () => {
+    const { base, bitrix, rzp } = await startApp();
+    const response = await post(base, "?deal_id=66&days=30");
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ error_code: "NOT_FOUND" });
+    // Turned away at the door: no Bitrix lookups and no comment on the deal.
+    expect(bitrix.calls).toEqual([]);
+    expect(rzp.calls).toEqual([]);
+  });
+
+  it("creates this year's link at the first reminder (201), then reuses it (200)", async () => {
+    const { base, rzp } = await startRecurring();
+
+    const first = await post(base, "?deal_id=66&days=30");
+    const second = await post(base, "?deal_id=66&days=15");
+
+    expect(first.status).toBe(201);
+    const created = (await first.json()) as { payment_link_id: string };
+    expect(created).toMatchObject({ status: "created", deal_id: "66", days_left: 30, amount: 99_900 });
+    expect(second.status).toBe(200);
+    expect(await second.json()).toMatchObject({ status: "reminded", payment_link_id: created.payment_link_id, days_left: 15 });
+    expect(rzp.created()).toHaveLength(1);
+  });
+
+  it("accepts deal_id and days in a JSON body too", async () => {
+    const { base } = await startRecurring();
+    const response = await post(base, "", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deal_id: 66, days: 30 }),
+    });
+    expect(response.status).toBe(201);
+  });
+
+  it.each([
+    ["missing days", "?deal_id=66"],
+    ["days that isn't a reminder", "?deal_id=66&days=7"],
+    ["missing deal_id", "?days=30"],
+  ])("returns 400 for %s", async (_label, query) => {
+    const { base, rzp } = await startRecurring();
+    const response = await post(base, query);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error_code: "BAD_REQUEST" });
+    expect(rzp.calls).toEqual([]);
+  });
+
+  it("refuses a Deals-pipeline deal (422)", async () => {
+    const { base, rzp } = await startRecurring();
+    const response = await post(base, "?deal_id=54&days=30"); // deal 54 is in the Deals pipeline
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({ error_code: "NOT_RECURRING_DEAL" });
+    expect(rzp.calls).toEqual([]);
+  });
+
+  it("needs the token when one is set, like /payment-links", async () => {
+    const { base } = await startRecurring({ INBOUND_API_TOKEN: "s3cret" });
+    expect((await post(base, "?deal_id=66&days=30")).status).toBe(401);
+    expect((await post(base, "?deal_id=66&days=30&token=s3cret")).status).toBe(201);
+  });
+
+  it("leaves the Deals pipeline's /payment-links working as before", async () => {
+    const { base } = await startRecurring();
+    const response = await fetch(`${base}/payment-links?deal_id=54`, { method: "POST" });
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ status: "created", reference_id: "54" });
+  });
+});
+
 // --------------------------------------------------------------------------- flow 2
 
 describe("POST /webhooks/razorpay", () => {
