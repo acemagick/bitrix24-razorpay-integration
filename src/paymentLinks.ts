@@ -375,12 +375,12 @@ async function retirePreviousLink(
  * can't be paid, and return a FlowError describing what happened. If the cancel
  * fails too, the error says the link is still live and must be cancelled by hand.
  */
-async function cancelUnsavedLink(
+export async function cancelUnsavedLink(
   dealId: string,
   linkId: string,
   shortUrl: string,
   updateErr: unknown,
-  deps: PaymentLinkDeps,
+  deps: Pick<PaymentLinkDeps, "razorpay" | "unresolvedLinks">,
 ): Promise<FlowError> {
   const saveError = toFlowError(updateErr, dealId);
   try {
@@ -420,12 +420,12 @@ async function cancelUnsavedLink(
 }
 
 /** Razorpay's answer for an ID that doesn't exist in this account/mode. */
-function isUnknownIdError(err: RazorpayApiError): boolean {
+export function isUnknownIdError(err: RazorpayApiError): boolean {
   return err.status === 404 || (err.status === 400 && /does not exist|not found|not a valid id/i.test(err.description));
 }
 
 /** Wrap a failure to check/cancel the old link with context the sales team can act on. */
-function previousLinkError(dealId: string, what: string, err: unknown): FlowError {
+export function previousLinkError(dealId: string, what: string, err: unknown): FlowError {
   const reason = err instanceof RazorpayApiError ? err.description : (err as Error).message;
   const code: ErrorCode = err instanceof RazorpayApiError ? "RAZORPAY_REJECTED" : "RAZORPAY_UNAVAILABLE";
   return new FlowError(
@@ -443,7 +443,7 @@ function previousLinkError(dealId: string, what: string, err: unknown): FlowErro
  * The order matters: subclasses (DealNotFoundError) must be checked before their
  * parent classes (BitrixApiError), or the more specific case would never match.
  */
-function toFlowError(err: unknown, dealId: string): FlowError {
+export function toFlowError(err: unknown, dealId: string): FlowError {
   if (err instanceof FlowError) return err;
 
   if (err instanceof DealNotFoundError) {

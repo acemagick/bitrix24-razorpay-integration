@@ -172,6 +172,8 @@ export interface FakeLink {
   reference_id: string;
   order_id?: string;
   notes: Record<string, string>;
+  /** When the link was created (Unix seconds), from the fake's clock. */
+  created_at?: number;
   /** The request body that created this link (only for links created through the API). */
   request?: Record<string, any>;
 }
@@ -191,7 +193,9 @@ export function createFakeRazorpay() {
   const orders = new Map<string, Record<string, unknown>>();
   const calls: string[] = [];
   const failures = new Map<string, Responder>();
-  const state = { latencyMs: 0, counter: 0 };
+  const state = { latencyMs: 0, counter: 0, nowSeconds: undefined as number | undefined };
+  // The fake's clock: real time, unless a test sets `nowSeconds` (e.g. to jump a year ahead).
+  const clock = () => state.nowSeconds ?? Math.floor(Date.now() / 1000);
 
   const error = (status: number, description: string, field?: string) =>
     json(status, { error: { code: "BAD_REQUEST_ERROR", description, ...(field && { field }) } });
@@ -224,6 +228,7 @@ export function createFakeRazorpay() {
           status: "created",
           reference_id: body.reference_id,
           notes: body.notes,
+          created_at: clock(),
           request: body,
         };
         links.set(link.id, link);
@@ -261,6 +266,10 @@ export function createFakeRazorpay() {
     set latencyMs(ms: number) {
       state.latencyMs = ms;
     },
+    /** Set the fake's clock (Unix seconds); links created afterwards get this created_at. */
+    set nowSeconds(seconds: number) {
+      state.nowSeconds = seconds;
+    },
     failOn(route: string, respond: Responder) {
       failures.set(route, respond);
     },
@@ -277,6 +286,7 @@ export function createFakeRazorpay() {
         status: "created",
         reference_id: "54",
         notes: { bitrix_deal_id: "54" },
+        created_at: clock(),
         ...link,
       };
       links.set(full.id, full);

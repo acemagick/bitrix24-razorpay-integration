@@ -89,6 +89,30 @@ export interface CreateLinkResponse {
   cancelled_previous_link_id?: string;
 }
 
+/** The three renewal reminders: days left before the yearly renewal. */
+export const RenewalReminderDays = [30, 15, 5] as const;
+export type RenewalReminder = (typeof RenewalReminderDays)[number];
+
+/** Successful response from POST /recurring/payment-links (the Recurring pipeline). */
+export interface RecurringLinkResponse {
+  /**
+   * created       this year's renewal link was just created
+   * reminded      this year's link already existed and is unpaid: the same link again
+   * already_paid  this year's renewal is paid: no link needed
+   */
+  status: "created" | "reminded" | "already_paid";
+  deal_id: string;
+  days_left: RenewalReminder;
+  payment_link_id: string;
+  short_url: string;
+  reference_id: string; // e.g. "66-2026": deal ID and the year the link was created
+  amount: number; // paise
+  amount_display: string;
+  currency: string;
+  /** Last year's link, if it was still unpaid and was cancelled before creating this year's. */
+  cancelled_previous_link_id?: string;
+}
+
 /**
  * Machine-readable error codes for the create-link endpoint.
  * `as const` makes TypeScript treat these as exact string values rather than
@@ -102,6 +126,7 @@ export const ErrorCodes = [
   "ALREADY_IN_PROGRESS", // a link for this deal is being created right now (double click)
   "ALREADY_PAID", // the deal's current link is already (partly) paid; no new link, to avoid charging twice
   "DEAL_NOT_FOUND",
+  "NOT_RECURRING_DEAL", // a renewal reminder was asked for a deal that isn't in the Recurring pipeline
   "INVALID_AMOUNT", // no amount, zero or negative
   "RAZORPAY_REJECTED", // Razorpay said no: bad amount, invalid customer data, auth failure
   "RAZORPAY_UNAVAILABLE", // couldn't reach Razorpay
