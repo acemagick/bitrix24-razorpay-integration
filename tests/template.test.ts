@@ -44,6 +44,16 @@ describe("template.yaml", () => {
     for (const name of required) expect(envVars, `${name} is missing from template.yaml`).toHaveProperty(name);
   });
 
+  it("passes the Recurring pipeline's ID, off (empty) unless given at deploy time", () => {
+    expect(envVars.RECURRING_CATEGORY_ID).toEqual({ Ref: "RecurringCategoryId" });
+    const param = template.Parameters.RecurringCategoryId;
+    expect(param.Default).toBe("");
+    // The same rule as src/config.ts: empty, or a pipeline ID number.
+    const allowed = new RegExp(param.AllowedPattern);
+    expect(["", "6", "12"].every((v) => allowed.test(v))).toBe(true);
+    expect(["Recurring", "C6:NEW"].some((v) => allowed.test(v))).toBe(false);
+  });
+
   it("gives the function the DynamoDB table, as Lambda requires", () => {
     expect(envVars.DYNAMODB_TABLE).toEqual({ Ref: "Table" });
     expect(fn.Policies).toContainEqual({ DynamoDBCrudPolicy: { TableName: { Ref: "Table" } } });

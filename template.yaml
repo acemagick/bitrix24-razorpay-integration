@@ -66,6 +66,11 @@ Parameters:
     Default: ""
     AllowedPattern: "^$|^[1-9][0-9]*$"
     Description: Days until a link expires; empty = never
+  RecurringCategoryId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]+$"
+    Description: ID of the Recurring pipeline (yearly renewal links, see npm run list-pipelines); empty = off
 
 # ----------------------------------------------------------------------------- resources
 Resources:
@@ -116,6 +121,8 @@ Resources:
           MOVE_DEAL_TO_WON: !Ref MoveDealToWon
           RAZORPAY_ACCEPT_PARTIAL: !Ref RazorpayAcceptPartial
           PAYMENT_LINK_EXPIRE_DAYS: !Ref PaymentLinkExpireDays
+          # The Recurring pipeline's Active stage defaults to C<this id>:NEW (see src/config.ts).
+          RECURRING_CATEGORY_ID: !Ref RecurringCategoryId
           DYNAMODB_TABLE: !Ref Table
           # Error messages in the logs point at the TypeScript source lines.
           NODE_OPTIONS: --enable-source-maps

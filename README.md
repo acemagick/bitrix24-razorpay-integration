@@ -4,6 +4,7 @@ A small Node.js service that connects Bitrix24 CRM deals with Razorpay payment l
 
 - **Flow 1: create a link.** Bitrix24 sends a deal ID. The service reads the deal's amount and contact, creates a Razorpay payment link, saves the link on the deal, and posts a timeline comment.
 - **Flow 2: payment updates.** Razorpay calls the service when a link is paid, partly paid, expires, is cancelled, or a payment attempt fails. The service posts a timeline comment on the right deal, and can move the deal to *Won*.
+- **Recurring pipeline: yearly renewal links.** For 1-year subscriptions, the reminder stages (1 month, 15 days, 5 days before renewal) share **one link per year**, valid until paid. A paid renewal moves the deal back to *Active* ([details](#recurring-pipeline-yearly-renewal-links)).
 
 Every problem (no amount, Razorpay rejected the request, Bitrix unreachable…) ends up as a **timeline comment on the deal**, so the sales team sees it inside the CRM rather than only in server logs.
 
@@ -27,14 +28,15 @@ Flow 2   Customer pays ──► Razorpay ──► POST /webhooks/razorpay ─�
 6. [Setting up Razorpay (test mode)](#setting-up-razorpay-test-mode)
 7. [Testing locally with ngrok](#testing-locally-with-ngrok)
 8. [Creating links automatically from a deal stage](#creating-links-automatically-from-a-deal-stage)
-9. [How it works](#how-it-works)
-10. [API reference](#api-reference)
-11. [Deploying to AWS Lambda](#deploying-to-aws-lambda)
-12. [Going live](#going-live)
-13. [Running on your own server instead](#running-on-your-own-server-instead)
-14. [Known limitations and open checks](#known-limitations-and-open-checks)
-15. [Troubleshooting](#troubleshooting)
-16. [Project structure](#project-structure)
+9. [Recurring pipeline: yearly renewal links](#recurring-pipeline-yearly-renewal-links)
+10. [How it works](#how-it-works)
+11. [API reference](#api-reference)
+12. [Deploying to AWS Lambda](#deploying-to-aws-lambda)
+13. [Going live](#going-live)
+14. [Running on your own server instead](#running-on-your-own-server-instead)
+15. [Known limitations and open checks](#known-limitations-and-open-checks)
+16. [Troubleshooting](#troubleshooting)
+17. [Project structure](#project-structure)
 
 ---
 
@@ -86,6 +88,7 @@ copy .env.example .env      # Windows cmd   (macOS/Linux/Git Bash: cp .env.examp
 | `npm run build` | Compile to JavaScript in `dist/`, for [running on your own server](#running-on-your-own-server-instead). |
 | `npm start` | Run the compiled service on your own server (after `npm run build`). |
 | `npm run list-fields` | List the deal's custom `UF_CRM_…` fields. Only needs `BITRIX_WEBHOOK_URL`. Add `-- --all` for every field. |
+| `npm run list-pipelines` | List the deal pipelines with their IDs and stage IDs (e.g. `Recurring` = 6, `Active` = `C6:NEW`). Only needs `BITRIX_WEBHOOK_URL`. |
 | `npm run check-setup [-- <dealId>]` | Read-only check of the whole setup, plus an optional dry run for one deal. |
 | `npm run send-webhook -- <event> <dealId>` | Send a fake, correctly signed Razorpay webhook to the running service ([details](#testing-without-a-razorpay-payment)). |
 
@@ -112,6 +115,8 @@ The service checks every value at startup and refuses to start, with a list of p
 | `PROCESSED_EVENTS_PATH` | no | `data/processed_events.json` | Where processed webhook IDs are remembered (duplicate protection) |
 | `UNRESOLVED_LINKS_PATH` | no | `data/unresolved_links.json` | Where links that were created but couldn't be saved or cancelled are remembered |
 | `DYNAMODB_TABLE` | on Lambda only | set by the deploy | A DynamoDB table name. When set, everything above that says "remembered" is kept in DynamoDB instead of the two files. The deploy sets it automatically; leave it empty on your computer. |
+| `RECURRING_CATEGORY_ID` | no | `6` | The Recurring pipeline's ID (`npm run list-pipelines`). Switches on the [yearly renewal links](#recurring-pipeline-yearly-renewal-links). Empty = off. On Lambda it's the `RecurringCategoryId` deploy setting. |
+| `RECURRING_ACTIVE_STAGE_ID` | no | `C6:NEW` | The stage a Recurring deal goes back to after its renewal is paid. Empty = the pipeline's first stage, `C<id>:NEW`. |
 | `PORT` | no | `8000` | HTTP port (your own server only) |
 
 To generate a random value for `RAZORPAY_WEBHOOK_SECRET` or `INBOUND_API_TOKEN`:
@@ -302,6 +307,76 @@ If nothing happens, check the logs ([Checking it works](#checking-it-works)). No
 
 ---
 
+## Recurring pipeline: yearly renewal links
+
+The client sells **1-year subscriptions**. A second pipeline, **Recurring**, reminds customers before each renewal:
+
+```
+Active  ──►  1 month  ──►  15 days  ──►  5 days        (paid → back to Active)
+(waiting)    └──────── renewal reminders ────────┘
+```
+
+This has its **own logic and its own address**, `POST /recurring/payment-links`, separate from the Deals pipeline's `/payment-links`, whose rules stay exactly as described above.
+
+### The rules
+
+- **One link per subscription year.** The three reminders of a year all use the **same link**, so the customer never gets three different ones.
+- **The link never expires.** It stays valid until it's paid.
+- **Every new year gets a new link:** year 1, year 2, year 3…
+- **The amount** is the Amount of the deal **in the Recurring pipeline**, set there by the team, not the original sale's amount.
+
+Each time a reminder stage is entered, the service looks at the deal's saved link (its *Razorpay Link ID* field):
+
+| The deal's saved link is… | What happens | Comment on the deal |
+|---|---|---|
+| none | **creates this year's link**, saves it on the deal | "Renewal payment link created (2026) … 1 month left" |
+| this year's, unpaid | **the same link again**, nothing new in Razorpay | "Renewal reminder (15 days left) … Same link as before" |
+| this year's, paid | nothing to charge | "This year's renewal is already paid" |
+| this year's, cancelled or expired (e.g. cancelled by hand) | a new link for this year | "Renewal payment link created …" |
+| last year's, paid | **a new link** for the new year | "Renewal payment link created (2027) …" |
+| last year's, still unpaid | **cancels it**, then creates this year's | "… Last year's unpaid link was cancelled" |
+
+**How "this year" is decided:** a link belongs to the year it was created in. One created **less than about 6 months ago** is this year's. The reminders of a year are at most a month apart and renewals are 12 months apart, so this needs no extra date field.
+
+**The receipt number** (`reference_id`) is `<deal ID>-<year>`, e.g. `66-2026`, and the link's notes also carry `subscription_year`.
+
+**When the renewal is paid**, the usual "Payment successful" comment is posted, and the deal is **moved back to Active** to wait for next year's reminders. Recurring deals are never moved to *Won*, whatever `MOVE_DEAL_TO_WON` says. If the move fails, a comment asks for it to be done by hand.
+
+The same safety rules as the Deals pipeline apply:
+- **Deals outside the Recurring pipeline are refused**, with a comment.
+- If the current link can't be checked or cancelled, **no new link** is made.
+- A link that can't be saved on the deal is cancelled.
+- Two requests for one deal at the same moment: the second is refused.
+
+### Setting it up
+
+1. **The pipeline in Bitrix24:** CRM → Deals → settings (gear) → **Pipelines and tunnels** → **Add pipeline**. Name it `Recurring`, with the in-progress stages **`Active`**, **`1 month`**, **`15 days`**, **`5 days`**, in that order.
+   - Deals wait in **Active**. The team (or Bitrix automation) moves them to *1 month*, *15 days* and *5 days* at the right times before the renewal date. The service only reacts when a deal **enters** a reminder stage.
+   - Optionally, a **tunnel** from the Deals pipeline's *Deal won* to *Active* copies every won deal into Recurring. Check that the copy's Amount is the renewal price.
+   - Make sure the *Razorpay Payment Link* and *Razorpay Link ID* fields are visible on Recurring deals (**Select field** on the deal card).
+2. **Its ID:** run `npm run list-pipelines`. You'll see e.g. `Pipeline ID 6: "Recurring"` and `Active (C6:NEW)`.
+3. **Tell the service:** put `RECURRING_CATEGORY_ID=6` in `.env`. On AWS, set the `RecurringCategoryId` deploy setting to `6` ([changing a setting](#changing-a-setting-eg-new-razorpay-keys)).
+4. **Three automation rules**, one per reminder stage. In **Automation rules**, switch to the **Recurring** pipeline, then add an **Outbound webhook** on each of *1 month*, *15 days* and *5 days*, set up [like the Deals rule](#creating-links-automatically-from-a-deal-stage) (Execution **Immediately**, one-line Handler, `{{ID}}` inserted with •••). The only difference is the address and a `days=` value:
+   ```
+   https://<your public address>/recurring/payment-links?deal_id={{ID}}&days=30&token=<token>   ← on "1 month"
+   https://<your public address>/recurring/payment-links?deal_id={{ID}}&days=15&token=<token>   ← on "15 days"
+   https://<your public address>/recurring/payment-links?deal_id={{ID}}&days=5&token=<token>    ← on "5 days"
+   ```
+5. **Sending the link to the customer** (email, SMS, WhatsApp) stays a Bitrix robot on each reminder stage, inserting the *Razorpay Payment Link* field. The field holds the same link all year, so every reminder carries the right one. Put that robot **after** the Outbound webhook, with a short delay (e.g. 1 minute), so the link is already saved when the first reminder of a year goes out.
+
+### Trying it
+
+With a test Recurring deal that has an Amount (Razorpay test mode):
+
+1. Move it to **1 month** → the link fields fill, with receipt `<id>-<year>`, and the comment "Renewal payment link created".
+2. Move it to **15 days** → comment "Same link as before", and no new link in the Razorpay dashboard.
+3. Pay the link with `success@razorpay` → "Payment successful", then "back in Active until next year's reminders". The deal is in **Active**.
+4. Move it to **5 days** → "This year's renewal is already paid".
+
+The "next year" cases can't be tried live without waiting a year. They're covered by the automated tests, which move a fake clock 12 months ahead (`tests/recurringLinks.test.ts`).
+
+---
+
 ## How it works
 
 ### Flow 1: creating a link (`POST /payment-links`)
@@ -362,6 +437,7 @@ Comments are plain text without emoji, because some Bitrix24 installations can't
 |---|---|---|
 | `GET /health` | `{"status":"ok"}` if the process is up. Doesn't call Bitrix or Razorpay. | none |
 | `POST /payment-links` | Create a link for a deal (flow 1) | `INBOUND_API_TOKEN` if set |
+| `POST /recurring/payment-links` | Renewal reminder for a Recurring-pipeline deal ([details](#post-recurringpayment-links)) | `INBOUND_API_TOKEN` if set |
 | `POST /webhooks/razorpay` | Razorpay webhooks (flow 2) | Razorpay signature |
 | `GET /bitrix/deal-fields` | Custom deal fields and their labels (`?all=true` for every field) | `INBOUND_API_TOKEN` if set |
 
@@ -404,6 +480,21 @@ The deal ID can be sent in the query string (`?deal_id=54`), as JSON (`{"deal_id
 | 503 | `BITRIX_UNAVAILABLE` | Bitrix24 couldn't be reached |
 | 503 | `STORAGE_UNAVAILABLE` | The service's own storage (DynamoDB on Lambda) couldn't be reached. No link is created, because a double click can't be ruled out. Try again in a minute. |
 | 500 | `INTERNAL_ERROR` | A bug; details are in the server log |
+
+### `POST /recurring/payment-links`
+
+Takes `deal_id` (query string, JSON or form, as above) and `days`, which must be `30`, `15` or `5`: the reminder, meaning 1 month, 15 days or 5 days left.
+
+| HTTP | `status` / `error_code` | Meaning |
+|---|---|---|
+| 201 | `created` | This year's link was just created |
+| 200 | `reminded` | This year's unpaid link already existed: the same link again |
+| 200 | `already_paid` | This year's renewal is paid; nothing to do |
+| 400 | `BAD_REQUEST` | Missing or invalid `deal_id`, or `days` not 30/15/5 |
+| 404 | `NOT_FOUND` | Renewal links are switched off (`RECURRING_CATEGORY_ID` not set) |
+| 422 | `NOT_RECURRING_DEAL` | The deal isn't in the Recurring pipeline (commented on the deal) |
+
+The other errors (401, 404 `DEAL_NOT_FOUND`, 409, 422 `INVALID_AMOUNT`, 502, 503) mean the same as for `/payment-links`. A successful reply looks like the `/payment-links` one, plus `days_left`, with `status` as above.
 
 ### `POST /webhooks/razorpay`
 
@@ -488,6 +579,7 @@ Don't run `sam build`: `npm run build:lambda` has already built the code. `sam d
 | AWS Region | `ap-south-1` |
 | BitrixWebhookUrl, BitrixPaymentLinkField, BitrixPaymentIdField, RazorpayKeyId, RazorpayKeySecret, RazorpayWebhookSecret, InboundApiToken | the same values as in your `.env`. `InboundApiToken` is **required** here, at least 16 characters. |
 | MoveDealToWon, RazorpayAcceptPartial, PaymentLinkExpireDays | **Enter** for the defaults, or your choice |
+| RecurringCategoryId | the Recurring pipeline's ID (e.g. `6`), or **Enter** to leave the renewal links off |
 | Confirm changes before deploy | `y` |
 | Allow SAM CLI IAM role creation | `Y` |
 | Disable rollback | `N` |
@@ -632,6 +724,10 @@ npm start
 | **AWS:** moving a deal to *Payment Link* does nothing, and the logs show **no** `POST /payment-links` | Bitrix never reached the service. The rule's Handler still has an old address, **contains a line break** (copied from a wrapped terminal line; use the [clipboard step](#creating-links-automatically-from-a-deal-stage)), or wasn't saved (there are two Save buttons). Then move the deal out of the stage and back in. |
 | **AWS:** logs show `POST /payment-links -> 400` | The address arrived, but the deal ID didn't. Re-insert it with **•••** → **Deal → ID** instead of typing `{{ID}}`. |
 | **AWS:** logs show `-> 401` | The `token=` in the rule's URL doesn't match the `InboundApiToken` given at deploy time. |
+| Recurring rule: `POST /recurring/payment-links -> 404` | Renewal links are off: `RecurringCategoryId` wasn't set at deploy time (or `RECURRING_CATEGORY_ID` locally). |
+| Recurring rule: `-> 400` | The `days=` in the rule's URL isn't `30`, `15` or `5`, or the deal ID wasn't inserted with •••. |
+| Comment "This deal isn't in the Recurring pipeline" | A recurring rule was added to the wrong pipeline, or `RecurringCategoryId` is the wrong ID. Check with `npm run list-pipelines`. |
+| A Recurring deal wasn't moved back to Active after paying | Look for the comment "could not be moved to Active automatically" and its reason. If the Active stage isn't the pipeline's first stage, set `RECURRING_ACTIVE_STAGE_ID`. |
 | `'aws'` / `'sam'` is not recognized | Close VS Code or the terminal app completely and reopen it after installing. |
 | `sam deploy --guided` seems frozen at a secret question | It isn't: secret answers are invisible while you type or paste. Paste once and press Enter. |
 | Deploy fails with `AccessDenied` / `not authorized to perform` | The deploy user is missing one of the six policies in [One-time setup](#one-time-setup). |
@@ -653,6 +749,7 @@ src/
   bitrix.ts          Bitrix24 REST calls and error handling
   razorpay.ts        Razorpay API calls, paise conversion, error handling
   paymentLinks.ts    flow 1: create a link for a deal (+ the file-based unresolved-links store)
+  recurringLinks.ts  the Recurring pipeline: one renewal link per year, reused by all reminders
   webhookHandler.ts  flow 2: signature, duplicates, finding the deal, comment text (+ the file-based event store)
   storage.ts         the three things the service remembers, as contracts (+ the in-memory deal lock)
   dynamoStorage.ts   the DynamoDB versions of those contracts, used on Lambda
@@ -660,6 +757,7 @@ src/
   models.ts          request/response shapes and webhook schemas (zod)
 scripts/
   listFields.ts      npm run list-fields
+  listPipelines.ts   npm run list-pipelines
   checkSetup.ts      npm run check-setup
   sendTestWebhook.ts npm run send-webhook
   buildLambda.mjs    npm run build:lambda
